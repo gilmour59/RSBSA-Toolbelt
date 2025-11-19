@@ -26,9 +26,11 @@ TARGET_COLS = [
     'farmer_address_mun', 
     'farmer_address_bgy', 
     'farmer', 
+    'farmworker',
     'fisherfolk', 
     'gender', 
-    'agency'
+    'agency',
+    'birthday'    # Added for Age Computation
 ]
 
 # --- UTILS ---
@@ -121,9 +123,19 @@ def select_input_file(input_dir):
 
 def process_rsbsa_report(file_path, output_dir):
     # 1. User Inputs
-    as_of_date = input("\n📅 Enter 'As Of' Date (e.g., Oct 30, 2024): ").strip()
-    if not as_of_date:
-        as_of_date = datetime.now().strftime("%B %d, %Y")
+    as_of_input = input("\n📅 Enter 'As Of' Date (e.g., Oct 30, 2024): ").strip()
+    if not as_of_input:
+        ref_date = datetime.now()
+        as_of_str = ref_date.strftime("%B %d, %Y")
+    else:
+        try:
+            # Try to parse the user input into a real date object for age calculation
+            ref_date = pd.to_datetime(as_of_input)
+            as_of_str = as_of_input
+        except:
+            print("⚠️  Could not parse date. Using today for age calculations.")
+            ref_date = datetime.now()
+            as_of_str = as_of_input
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     default_name = f"RSBSA_Region6_Summary_{timestamp}.xlsx"
@@ -172,48 +184,78 @@ def process_rsbsa_report(file_path, output_dir):
                     col_mun = 'farmer_address_mun'
                     col_bgy = 'farmer_address_bgy'
                     col_farmer = 'farmer'
+                    col_farmworker = 'farmworker'
                     col_fisher = 'fisherfolk'
                     col_gender = 'gender'
                     col_agency = 'agency'
+                    col_birthday = 'birthday'
 
-                    # Calculations
+                    # --- BASIC COUNTS ---
                     df['is_farmer'] = df[col_farmer].astype(str).str.upper().map({'YES': 1}).fillna(0)
+                    df['is_farmworker'] = df[col_farmworker].astype(str).str.upper().map({'YES': 1}).fillna(0)
                     df['is_fisher'] = df[col_fisher].astype(str).str.upper().map({'YES': 1}).fillna(0)
+                    
                     df['male_count'] = df[col_gender].astype(str).str.upper().map({'MALE': 1}).fillna(0)
                     df['female_count'] = df[col_gender].astype(str).str.upper().map({'FEMALE': 1}).fillna(0)
 
-                    # Group By
+                    # --- AGE PROFILING ---
+                    # Convert birthday to datetime, handle errors (bad dates become NaT)
+                    df['bd_dt'] = pd.to_datetime(df[col_birthday], errors='coerce')
+                    
+                    # Calculate Age in Years: (RefDate - BirthDate) / 365.25
+                    # fillna(-1) ensures invalid dates don't crash the logic, they just become -1
+                    df['age_years'] = (ref_date - df['bd_dt']).dt.days / 365.25
+                    df['age_years'] = df['age_years'].fillna(-1)
+
+                    # Classify
+                    # Youth: 15 to 30
+                    df['is_youth'] = ((df['age_years'] >= 15) & (df['age_years'] <= 30)).astype(int)
+                    # Working Age: 31 to 59
+                    df['is_working_age'] = ((df['age_years'] > 30) & (df['age_years'] < 60)).astype(int)
+                    # Senior: 60+
+                    df['is_senior'] = (df['age_years'] >= 60).astype(int)
+
+                    # --- AGGREGATION ---
                     summary = df.groupby([col_mun, col_bgy]).agg({
                         'is_farmer': 'sum',
+                        'is_farmworker': 'sum',
                         'is_fisher': 'sum',
                         col_agency: 'nunique',
                         'male_count': 'sum',
-                        'female_count': 'sum'
+                        'female_count': 'sum',
+                        'is_youth': 'sum',
+                        'is_working_age': 'sum',
+                        'is_senior': 'sum'
                     }).reset_index()
 
                     summary.columns = [
                         'Municipality', 'Barangay', 
-                        'Farmers', 'Fisherfolk', 
-                        'Distinct Agencies', 'Male', 'Female'
+                        'Farmers', 'Farmworkers', 'Fisherfolk', 
+                        'Distinct Agencies', 'Male', 'Female',
+                        'Youth (15-30)', 'Working Age (31-59)', 'Senior (60+)'
                     ]
 
                     summary = summary.sort_values(['Municipality', 'Barangay'])
 
                     # Write
-                    summary.to_excel(writer, sheet_name=province, index=False, startrow=2)
+                    # Changed startrow from 2 to 4 to make room for the legend
+                    summary.to_excel(writer, sheet_name=province, index=False, startrow=4)
                     
                     # Header
                     workbook = writer.book
                     worksheet = writer.sheets[province]
                     header_format = workbook.add_format({'bold': True, 'font_size': 14})
                     date_format = workbook.add_format({'italic': True})
+                    legend_format = workbook.add_format({'italic': True, 'font_color': 'gray', 'font_size': 10})
                     
                     worksheet.write('A1', f"RSBSA Summary Report - {province}", header_format)
-                    worksheet.write('A2', f"As of: {as_of_date}", date_format)
+                    worksheet.write('A2', f"As of: {as_of_str}", date_format)
+                    worksheet.write('A3', "Age Legend: Youth (15-30) | Working Age (31-59) | Senior (60+)", legend_format)
                     
-                    worksheet.set_column(0, 0, 20)
-                    worksheet.set_column(1, 1, 25)
-                    worksheet.set_column(2, 6, 15)
+                    # Formatting columns
+                    worksheet.set_column(0, 0, 20) # Mun
+                    worksheet.set_column(1, 1, 25) # Bgy
+                    worksheet.set_column(2, 10, 15) # Stats
                 
                 print(f"   ✅ Processed {province}")
 
