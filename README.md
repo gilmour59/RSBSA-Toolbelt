@@ -1,42 +1,41 @@
-# **How to Build a Standalone .exe**
+# **How to Build the RSBSA Toolbelt as a Standalone App**
 
-This guide will turn your Python script into a single .exe file that you can email to colleagues or put on a shared drive. They do not need Python installed to run it.
+## **⚠️ Crucial Note for Mac Users**
 
-## **1\. Preparation**
+PyInstaller builds for the OS you are currently using.
 
-Ensure you have the necessary libraries installed:
+* **Running on Mac?** You will get a Mac executable.  
+* **Running on Windows?** You will get a Windows .exe.
 
-pip install \-r requirements.txt
+**You cannot build a Windows .exe directly on a Mac.**
 
-## **2\. The Build Command**
+If you are on a Mac but need a Windows app, use **Option C** below.
 
-Run the following command in your terminal.
+## **Option A: Optimized Single File (Windows Native)**
 
-*Note: We use excel\_merger.py (the GUI version), not the web version.*
+*Run this ON A WINDOWS COMPUTER to get a .exe*
 
-pyinstaller \--noconsole \--onefile \--name="ExcelMerger" excel\_merger.py
+pyinstaller \--onefile \--name="RSBSAToolbelt\_Optimized" \--exclude-module matplotlib \--exclude-module tkinter \--exclude-module scipy \--exclude-module PIL rsbsa\_toolbelt.py
 
-### **What do these flags do?**
+* **Result:** A single .exe in dist/.  
+* **Startup:** \~3-5 seconds.
 
-* \--noconsole: The app will open like a normal Windows app, without a black command prompt window appearing behind it.  
-* \--onefile: Bundles everything (Python, Pandas, your code) into a single .exe file.  
-* \--name: Sets the name of your output file.
+## **Option B: Folder (Instant Start)**
 
-## **3\. Locate your App**
+*Run this ON A WINDOWS COMPUTER to get a .exe*
 
-Once the command finishes (it may take 1-2 minutes):
+pyinstaller \--onedir \--name="RSBSAToolbelt\_Fast" rsbsa\_toolbelt.py
 
-1. Go to the new **dist** folder created in your project directory.  
-2. You will find **ExcelMerger.exe**.
+* **Result:** A folder in dist/.  
+* **Startup:** Instant.
 
-## **4\. Testing & Sharing**
+## **Option C: Building for Windows using GitHub (For Mac Users)**
 
-* Move ExcelMerger.exe to a different folder or computer to test it.  
-* You can now zip this file and share it\!
+If you don't have a Windows PC handy, use GitHub Actions:
 
-## **Common Questions**
-
-Q: Why is the file size large (\~50MB+)?  
-A: It contains the entire Python engine and the Pandas library embedded inside it so your users don't need to install anything.  
-Q: Can I build a Mac app on Windows?  
-A: No. PyInstaller builds for the OS you are currently using. To build a Mac .app file, you must run these commands on a Mac.
+1. Create a folder .github/workflows in your project.  
+2. Add the build\_windows.yml file provided.  
+3. Push your code to GitHub.  
+4. Go to the **Actions** tab on your repository page.  
+5. Click on the latest workflow run.  
+6. Scroll down to **Artifacts** and download your .exe.
