@@ -1,2 +1,6 @@
 input_files/*.*
 output_files/*.*
+venv
+build
+dist
+RSBSAToolbelt_Fast.spec
