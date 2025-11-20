@@ -255,9 +255,10 @@ def process_rsbsa_report(file_path, output_dir):
 def process_geotag_cleaning(file_path, output_dir):
     """Deduplicates based on GEOREF ID and Filters Columns"""
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    clean_filename = f"Geotag_CLEANED_{timestamp}.xlsx"
-    dupe_filename = f"Geotag_DUPLICATES_{timestamp}.xlsx"
+    # CHANGED: Use original filename + tag instead of timestamp
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    clean_filename = f"{base_name} [clean].xlsx"
+    dupe_filename = f"{base_name} [duplicates].xlsx"
     
     clean_path = os.path.join(output_dir, clean_filename)
     dupe_path = os.path.join(output_dir, dupe_filename)
@@ -338,16 +339,14 @@ def run_cli_app():
         print("   [1] Stack Rows (Strict Mode - Merge files with same columns)")
         print("   [2] Combine to Sheets (Group files into tabs)")
         print("   [3] Generate Regional Summary (Analytics per Barangay)")
-        print("   [4] Geotag Cleaner (Deduplicate & Filter Columns)")
+        print("   [4] Geotag Cleaner [Clean] (Deduplicate & Filter Columns)")
         print("   [Q] Quit")
         
         choice = input("\nSelect option: ").strip().upper()
 
         if choice == "1":
-            # (Code for Stack Rows - same as before, abbreviated here for brevity but included in execution)
             run_stack_rows(input_dir, output_dir)
         elif choice == "2":
-            # (Code for Combine Sheets - same as before)
             run_combine_sheets(input_dir, output_dir)
         elif choice == "3":
             target_file = select_input_file(input_dir)
@@ -376,8 +375,7 @@ def run_stack_rows(input_dir, output_dir):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     output_filename = get_output_filename(f"Stacked_Output_{timestamp}.xlsx")
     merged_data = []
-    # ... (Implementation maintained from previous version)
-    # For brevity in this display, I'm ensuring the logic runs as established previously
+    
     for filename in all_files:
         file_path = os.path.join(input_dir, filename)
         try:
