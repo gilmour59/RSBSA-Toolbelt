@@ -281,7 +281,7 @@ def process_unified_geotag(geotag_path, parcel_path, output_dir):
     2. Preps Parcel (Filter Commodity, Dedupe ID)
     3. Merges (Adds CROP AREA) with Commodity Check
     4. Calculates FINDINGS
-    5. Summarizes VERIFIED AREA per UPLOADER
+    5. Summarizes VERIFIED AREA per UPLOADER (Only 'OK' findings)
     """
     base_name = os.path.splitext(os.path.basename(geotag_path))[0]
     output_filename = f"{base_name} [clean_enriched].xlsx"
@@ -425,15 +425,18 @@ def process_unified_geotag(geotag_path, parcel_path, output_dir):
             else:
                 print(f"   ⚠️ Warning: Could not rearrange columns. Missing: {missing_final}")
 
-        # --- STEP 5: SUMMARIZE BY UPLOADER ---
+        # --- STEP 5: SUMMARIZE BY UPLOADER (FILTERED) ---
         with LoadingSpinner("Generating Uploader Summary..."):
             # Ensure VERIFIED AREA is numeric for summing
             df_final['VERIFIED AREA (Ha)'] = pd.to_numeric(df_final['VERIFIED AREA (Ha)'], errors='coerce').fillna(0)
             
+            # FILTER: Only sum up rows where FINDINGS == 'OK'
+            df_ok_only = df_final[df_final['FINDINGS'] == 'OK']
+            
             # Group and Sum
-            df_summary = df_final.groupby('UPLOADER')[['VERIFIED AREA (Ha)']].sum().reset_index()
-            df_summary = df_summary.rename(columns={'VERIFIED AREA (Ha)': 'TOTAL VERIFIED AREA (Ha)'})
-            df_summary = df_summary.sort_values('TOTAL VERIFIED AREA (Ha)', ascending=False)
+            df_summary = df_ok_only.groupby('UPLOADER')[['VERIFIED AREA (Ha)']].sum().reset_index()
+            df_summary = df_summary.rename(columns={'VERIFIED AREA (Ha)': 'TOTAL VERIFIED AREA (Ha) [OK Only]'})
+            df_summary = df_summary.sort_values('TOTAL VERIFIED AREA (Ha) [OK Only]', ascending=False)
 
         # --- STEP 6: SAVE ---
         with LoadingSpinner(f"Saving result to {output_filename}..."):
@@ -453,7 +456,7 @@ def process_unified_geotag(geotag_path, parcel_path, output_dir):
                 
                 # Columns
                 ws_summ.set_column(0, 0, 35) # Uploader Name Width
-                ws_summ.set_column(1, 1, 25, num_fmt) # Area Width + Format
+                ws_summ.set_column(1, 1, 35, num_fmt) # Area Width + Format
                 
                 # 2. Write Clean Data Sheet (Second)
                 df_final.to_excel(writer, sheet_name='Clean Data', index=False)
