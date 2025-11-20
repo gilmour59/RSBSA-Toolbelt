@@ -43,7 +43,8 @@ TARGET_COLS_GEOTAG = [
     'PROVINCE',
     'MUNICIPALITY',
     'BARANGAY',
-    'UPLOADER'
+    'UPLOADER',
+    'TRACK DATE'
 ]
 
 # Output Order for Mode 4
@@ -57,6 +58,7 @@ FINAL_COLUMN_ORDER = [
     'DECLARED AREA (Ha)',
     'CROP AREA',
     'VERIFIED AREA (Ha)',
+    'TRACK DATE',
     'FINDINGS',
     'UPLOADER'
 ]
@@ -68,6 +70,7 @@ def clear_screen():
 def print_header():
     print("="*70)
     print("   🌾  RSBSA TOOLBELT (Region 6)")
+    print("   Powered by XlsxWriter")
     print("="*70)
 
 class LoadingSpinner:
@@ -225,7 +228,9 @@ def process_rsbsa_report(file_path, output_dir):
                     df['bd_dt'] = pd.to_datetime(df[col_birthday], errors='coerce')
                     df['age_years'] = (ref_date - df['bd_dt']).dt.days / 365.25
                     df['age_years'] = df['age_years'].fillna(-1)
-                    df['is_youth'] = ((df['age_years'] >= 15) & (df['age_years'] <= 30)).astype(int)
+                    
+                    # CHANGED: Youth is now 12-30
+                    df['is_youth'] = ((df['age_years'] >= 12) & (df['age_years'] <= 30)).astype(int)
                     df['is_working_age'] = ((df['age_years'] > 30) & (df['age_years'] < 60)).astype(int)
                     df['is_senior'] = (df['age_years'] >= 60).astype(int)
 
@@ -245,7 +250,7 @@ def process_rsbsa_report(file_path, output_dir):
                         'Municipality', 'Barangay', 
                         'Farmers', 'Farmworkers', 'Fisherfolk', 
                         'Distinct Agencies', 'Male', 'Female',
-                        'Youth (15-30)', 'Working Age (31-59)', 'Senior (60+)'
+                        'Youth (12-30)', 'Working Age (31-59)', 'Senior (60+)'
                     ]
 
                     summary = summary.sort_values(['Municipality', 'Barangay'])
@@ -261,7 +266,8 @@ def process_rsbsa_report(file_path, output_dir):
                     
                     worksheet.write('A1', f"RSBSA Summary Report - {province}", header_format)
                     worksheet.write('A2', f"As of: {as_of_str}", date_format)
-                    worksheet.write('A3', "Age Legend: Youth (15-30) | Working Age (31-59) | Senior (60+)", legend_format)
+                    # CHANGED: Updated Legend Text
+                    worksheet.write('A3', "Age Legend: Youth (12-30) | Working Age (31-59) | Senior (60+)", legend_format)
                     
                     worksheet.set_column(0, 0, 20)
                     worksheet.set_column(1, 1, 25)
@@ -280,8 +286,9 @@ def process_unified_geotag(geotag_path, parcel_path, output_dir):
     1. Cleans Geotag (Dedupe GEOREF ID, Filter Columns)
     2. Preps Parcel (Filter Commodity, Dedupe ID)
     3. Merges (Adds CROP AREA) with Commodity Check
-    4. Calculates FINDINGS
-    5. Summarizes VERIFIED AREA per UPLOADER (Only 'OK' findings)
+    4. Checks TRACK DATE
+    5. Calculates FINDINGS
+    6. Summarizes VERIFIED AREA per UPLOADER (OK only)
     """
     base_name = os.path.splitext(os.path.basename(geotag_path))[0]
     output_filename = f"{base_name} [clean_enriched].xlsx"
@@ -358,7 +365,7 @@ def process_unified_geotag(geotag_path, parcel_path, output_dir):
             mask = df_parcel['COMMODITY'].astype(str).str.contains(r'Rice|Palay|Corn|Sugarcane', flags=re.IGNORECASE, regex=True)
             df_parcel = df_parcel[mask]
             
-            # IMPORTANT: We DO NOT dedupe Parcel ID yet. 
+            # We DO NOT dedupe Parcel ID yet to allow commodity checks.
 
         print(f"   Parcel List References: {len(df_parcel)} (Rice/Corn/Sugar)")
 
@@ -367,7 +374,7 @@ def process_unified_geotag(geotag_path, parcel_path, output_dir):
             # 1. Merge (This expands rows 1-to-Many)
             df_merged = pd.merge(
                 df_clean_geo,
-                df_parcel, # Contains KEY_ID, CROP AREA, COMMODITY (y)
+                df_parcel, 
                 left_on='RSBSA ID',
                 right_on='KEY_ID',
                 how='left',
@@ -395,17 +402,29 @@ def process_unified_geotag(geotag_path, parcel_path, output_dir):
             
             df_final['CROP AREA'] = df_final.apply(finalize_crop_area, axis=1)
 
-        # --- STEP 4: FINDINGS & REARRANGE ---
+        # --- STEP 4: FINDINGS & TRACK DATE CHECK ---
         with LoadingSpinner("Calculating Findings..."):
+            
+            # Pre-parse Track Date for speed
+            df_final['temp_track_dt'] = pd.to_datetime(df_final['TRACK DATE'], errors='coerce')
+            cutoff_date = pd.Timestamp("2024-01-01")
+
             def calc_findings(row):
+                # 1. CHECK TRACK DATE
+                dt = row['temp_track_dt']
+                if pd.isna(dt) or dt < cutoff_date:
+                    return "INVALID DATE (< 2024)"
+
+                # 2. CHECK CROP AREA
                 crop_val = row['CROP AREA']
                 ver_val = row['VERIFIED AREA (Ha)']
                 
-                if isinstance(crop_val, str):
+                if isinstance(crop_val, str): # "ID NOT FOUND", "MISMATCH"
                     return "NO CROP AREA"
                 if pd.isna(crop_val):
                     return "NO CROP AREA"
                 
+                # 3. CHECK VARIANCE
                 try:
                     crop_num = float(crop_val)
                     ver_num = float(ver_val)
@@ -417,6 +436,7 @@ def process_unified_geotag(geotag_path, parcel_path, output_dir):
                 return "OK"
 
             df_final['FINDINGS'] = df_final.apply(calc_findings, axis=1)
+            df_final.drop(columns=['temp_track_dt'], inplace=True)
             
             # Rearrange
             missing_final = [c for c in FINAL_COLUMN_ORDER if c not in df_final.columns]
@@ -425,23 +445,23 @@ def process_unified_geotag(geotag_path, parcel_path, output_dir):
             else:
                 print(f"   ⚠️ Warning: Could not rearrange columns. Missing: {missing_final}")
 
-        # --- STEP 5: SUMMARIZE BY UPLOADER (FILTERED) ---
+        # --- STEP 5: SUMMARIZE BY UPLOADER ---
         with LoadingSpinner("Generating Uploader Summary..."):
-            # Ensure VERIFIED AREA is numeric for summing
+            # Ensure VERIFIED AREA is numeric
             df_final['VERIFIED AREA (Ha)'] = pd.to_numeric(df_final['VERIFIED AREA (Ha)'], errors='coerce').fillna(0)
             
-            # FILTER: Only sum up rows where FINDINGS == 'OK'
-            df_ok_only = df_final[df_final['FINDINGS'] == 'OK']
-            
-            # Group and Sum
-            df_summary = df_ok_only.groupby('UPLOADER')[['VERIFIED AREA (Ha)']].sum().reset_index()
-            df_summary = df_summary.rename(columns={'VERIFIED AREA (Ha)': 'TOTAL VERIFIED AREA (Ha) [OK Only]'})
-            df_summary = df_summary.sort_values('TOTAL VERIFIED AREA (Ha) [OK Only]', ascending=False)
+            # FILTER: Only sum rows where FINDINGS == 'OK'
+            df_ok = df_final[df_final['FINDINGS'] == 'OK']
+
+            # Group and Sum based on OK rows only
+            df_summary = df_ok.groupby('UPLOADER')[['VERIFIED AREA (Ha)']].sum().reset_index()
+            df_summary = df_summary.rename(columns={'VERIFIED AREA (Ha)': 'TOTAL VERIFIED AREA (Ha)'})
+            df_summary = df_summary.sort_values('TOTAL VERIFIED AREA (Ha)', ascending=False)
 
         # --- STEP 6: SAVE ---
         with LoadingSpinner(f"Saving result to {output_filename}..."):
             with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
-                # 1. Write Summary Sheet (First)
+                # 1. Summary
                 df_summary.to_excel(writer, sheet_name='Uploader Summary', index=False)
                 
                 # Format Summary
@@ -450,15 +470,12 @@ def process_unified_geotag(geotag_path, parcel_path, output_dir):
                 bold_fmt = workbook.add_format({'bold': True, 'bg_color': '#D9EAD3', 'border': 1})
                 num_fmt = workbook.add_format({'num_format': '#,##0.00', 'border': 1})
                 
-                # Header
                 for col_num, value in enumerate(df_summary.columns.values):
                     ws_summ.write(0, col_num, value, bold_fmt)
+                ws_summ.set_column(0, 0, 35)
+                ws_summ.set_column(1, 1, 25, num_fmt)
                 
-                # Columns
-                ws_summ.set_column(0, 0, 35) # Uploader Name Width
-                ws_summ.set_column(1, 1, 35, num_fmt) # Area Width + Format
-                
-                # 2. Write Clean Data Sheet (Second)
+                # 2. Clean Data
                 df_final.to_excel(writer, sheet_name='Clean Data', index=False)
 
         print(f"\n🎉 Success! File saved: {output_filename}")
