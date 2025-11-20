@@ -229,7 +229,7 @@ def process_rsbsa_report(file_path, output_dir):
                     df['age_years'] = (ref_date - df['bd_dt']).dt.days / 365.25
                     df['age_years'] = df['age_years'].fillna(-1)
                     
-                    # CHANGED: Youth is now 12-30
+                    # Youth 12-30
                     df['is_youth'] = ((df['age_years'] >= 12) & (df['age_years'] <= 30)).astype(int)
                     df['is_working_age'] = ((df['age_years'] > 30) & (df['age_years'] < 60)).astype(int)
                     df['is_senior'] = (df['age_years'] >= 60).astype(int)
@@ -266,7 +266,6 @@ def process_rsbsa_report(file_path, output_dir):
                     
                     worksheet.write('A1', f"RSBSA Summary Report - {province}", header_format)
                     worksheet.write('A2', f"As of: {as_of_str}", date_format)
-                    # CHANGED: Updated Legend Text
                     worksheet.write('A3', "Age Legend: Youth (12-30) | Working Age (31-59) | Senior (60+)", legend_format)
                     
                     worksheet.set_column(0, 0, 20)
@@ -288,7 +287,7 @@ def process_unified_geotag(geotag_path, parcel_path, output_dir):
     3. Merges (Adds CROP AREA) with Commodity Check
     4. Checks TRACK DATE
     5. Calculates FINDINGS
-    6. Summarizes VERIFIED AREA per UPLOADER (OK only)
+    6. Summarizes VERIFIED AREA per UPLOADER (Only if OK)
     """
     base_name = os.path.splitext(os.path.basename(geotag_path))[0]
     output_filename = f"{base_name} [clean_enriched].xlsx"
@@ -450,13 +449,21 @@ def process_unified_geotag(geotag_path, parcel_path, output_dir):
             # Ensure VERIFIED AREA is numeric
             df_final['VERIFIED AREA (Ha)'] = pd.to_numeric(df_final['VERIFIED AREA (Ha)'], errors='coerce').fillna(0)
             
-            # FILTER: Only sum rows where FINDINGS == 'OK'
-            df_ok = df_final[df_final['FINDINGS'] == 'OK']
+            # Create a helper column specifically for summing
+            # If Finding is OK, take Verified Area. Else, take 0.
+            df_final['sum_area'] = df_final.apply(
+                lambda x: x['VERIFIED AREA (Ha)'] if x['FINDINGS'] == 'OK' else 0, 
+                axis=1
+            )
 
-            # Group and Sum based on OK rows only
-            df_summary = df_ok.groupby('UPLOADER')[['VERIFIED AREA (Ha)']].sum().reset_index()
-            df_summary = df_summary.rename(columns={'VERIFIED AREA (Ha)': 'TOTAL VERIFIED AREA (Ha)'})
+            # Group by UPLOADER and sum the helper column
+            # This ensures ALL uploaders appear, even if they have 0 valid area
+            df_summary = df_final.groupby('UPLOADER')[['sum_area']].sum().reset_index()
+            df_summary = df_summary.rename(columns={'sum_area': 'TOTAL VERIFIED AREA (Ha)'})
             df_summary = df_summary.sort_values('TOTAL VERIFIED AREA (Ha)', ascending=False)
+            
+            # Drop helper column so it doesn't show in the final file
+            df_final.drop(columns=['sum_area'], inplace=True)
 
         # --- STEP 6: SAVE ---
         with LoadingSpinner(f"Saving result to {output_filename}..."):
