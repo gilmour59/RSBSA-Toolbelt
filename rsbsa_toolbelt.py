@@ -42,7 +42,23 @@ TARGET_COLS_GEOTAG = [
     'VERIFIED AREA (Ha)',
     'PROVINCE',
     'MUNICIPALITY',
-    'BARANGAY'
+    'BARANGAY',
+    'UPLOADER'
+]
+
+# Output Order for Mode 4
+FINAL_COLUMN_ORDER = [
+    'GEOREF ID',
+    'RSBSA ID',
+    'COMMODITY',
+    'PROVINCE',
+    'MUNICIPALITY',
+    'BARANGAY',
+    'DECLARED AREA (Ha)',
+    'CROP AREA',
+    'VERIFIED AREA (Ha)',
+    'FINDINGS',
+    'UPLOADER'
 ]
 
 # --- UTILS ---
@@ -116,7 +132,15 @@ def clean_sheet_name(name):
     name = re.sub(r'[\[\]:*?/\\]', '', name)
     return name[:31]
 
-def select_input_file(input_dir):
+def normalize_commodity(val):
+    """Normalizes commodity names for matching (Rice/Palay equivalence)"""
+    s = str(val).strip().upper()
+    if 'RICE' in s or 'PALAY' in s: return 'RICE'
+    if 'CORN' in s: return 'CORN'
+    if 'SUGAR' in s: return 'SUGAR'
+    return 'OTHER'
+
+def select_input_file(input_dir, prompt="Select file number to process"):
     files = [f for f in os.listdir(input_dir) if f.lower().endswith(('.xlsx', '.csv')) and not f.startswith('~$')]
     
     if not files:
@@ -128,7 +152,7 @@ def select_input_file(input_dir):
         print(f"   [{i+1}] {f}")
     
     while True:
-        choice = input("\nSelect file number to process: ").strip()
+        choice = input(f"\n{prompt}: ").strip()
         if choice.isdigit() and 1 <= int(choice) <= len(files):
             return os.path.join(input_dir, files[int(choice)-1])
         print("❌ Invalid selection.")
@@ -156,7 +180,6 @@ def process_rsbsa_report(file_path, output_dir):
     output_path = os.path.join(output_dir, output_filename)
 
     try:
-        # Helper to filter cols
         def col_filter(col_name):
             return col_name.strip().lower() in TARGET_COLS_RSBSA
 
@@ -250,70 +273,167 @@ def process_rsbsa_report(file_path, output_dir):
     except Exception as e:
         print(f"❌ Critical Error: {e}")
 
-# --- MODE 4: GEOTAG CLEANER ---
+# --- MODE 4: UNIFIED GEOTAG (CLEAN + ENRICH) ---
 
-def process_geotag_cleaning(file_path, output_dir):
-    """Deduplicates based on GEOREF ID and Filters Columns"""
-    
-    # CHANGED: Use original filename + tag instead of timestamp
-    base_name = os.path.splitext(os.path.basename(file_path))[0]
-    clean_filename = f"{base_name} [clean].xlsx"
+def process_unified_geotag(geotag_path, parcel_path, output_dir):
+    """
+    1. Cleans Geotag (Dedupe GEOREF ID, Filter Columns)
+    2. Preps Parcel (Filter Commodity, Dedupe ID)
+    3. Merges (Adds CROP AREA) with Commodity Check
+    4. Calculates FINDINGS
+    """
+    base_name = os.path.splitext(os.path.basename(geotag_path))[0]
+    output_filename = f"{base_name} [clean_enriched].xlsx"
     dupe_filename = f"{base_name} [duplicates].xlsx"
-    
-    clean_path = os.path.join(output_dir, clean_filename)
+    output_path = os.path.join(output_dir, output_filename)
     dupe_path = os.path.join(output_dir, dupe_filename)
 
+    print("\n--- Geotag Cleaning & Enrichment ---")
+    print(f"   1. Target File: {os.path.basename(geotag_path)}")
+    print(f"   2. Source File: {os.path.basename(parcel_path)}")
+
     try:
-        # Load Data
-        with LoadingSpinner(f"Loading '{os.path.basename(file_path)}'..."):
-            if file_path.lower().endswith('.csv'):
-                df = pd.read_csv(file_path)
+        # --- STEP 1: LOAD & CLEAN GEOTAG ---
+        with LoadingSpinner("Loading & Cleaning Geotag file..."):
+            if geotag_path.lower().endswith('.csv'):
+                df_geo = pd.read_csv(geotag_path)
             else:
-                df = pd.read_excel(file_path)
+                df_geo = pd.read_excel(geotag_path)
+            
+            # Normalize & Check
+            df_geo.columns = [c.strip() for c in df_geo.columns]
+            missing = [c for c in TARGET_COLS_GEOTAG if c not in df_geo.columns]
+            if missing:
+                print(f"\n🛑 Error: Geotag file missing columns: {missing}")
+                return
 
-        # Normalize Columns: Remove extra spaces and convert to uppercase for matching
-        # But we keep original names for output if possible, or map them
-        df.columns = [c.strip() for c in df.columns]
-        
-        # Check for missing target columns
-        missing_cols = [c for c in TARGET_COLS_GEOTAG if c not in df.columns]
-        if missing_cols:
-            print("\n🛑 MISSING COLUMNS!")
-            print(f"   The file is missing: {', '.join(missing_cols)}")
-            print("   Available columns:", list(df.columns))
-            return
+            # Filter Columns
+            df_geo = df_geo[TARGET_COLS_GEOTAG].copy()
 
-        # Filter Columns
-        df_filtered = df[TARGET_COLS_GEOTAG].copy()
-        
-        print(f"\n   Total Rows Loaded: {len(df_filtered)}")
+            # Deduplicate GEOREF ID
+            dupe_mask = df_geo.duplicated(subset=['GEOREF ID'], keep=False)
+            df_duplicates = df_geo[dupe_mask].sort_values('GEOREF ID')
+            
+            # Keep First unique
+            df_clean_geo = df_geo.drop_duplicates(subset=['GEOREF ID'], keep='first')
 
-        # Find Duplicates (Duplicate GEOREF ID)
-        # keep=False means mark ALL duplicates as True so we can see them in report
-        dupe_mask = df_filtered.duplicated(subset=['GEOREF ID'], keep=False)
-        df_duplicates = df_filtered[dupe_mask].sort_values('GEOREF ID')
-        
-        # Create Clean Version (Keep First)
-        df_clean = df_filtered.drop_duplicates(subset=['GEOREF ID'], keep='first')
+        print(f"   Geotag Rows: {len(df_geo)} -> {len(df_clean_geo)} (Removed {len(df_geo)-len(df_clean_geo)} duplicates)")
 
-        print(f"   Unique (Clean) Rows: {len(df_clean)}")
-        print(f"   Duplicate Rows Found: {len(df_duplicates)}")
-
-        # Save Clean File
-        with LoadingSpinner("Saving Cleaned File..."):
-            with pd.ExcelWriter(clean_path, engine='xlsxwriter') as writer:
-                df_clean.to_excel(writer, index=False, sheet_name='Clean Data')
-        
-        # Save Duplicates Report (if any)
+        # Save Duplicates Report if exist
         if not df_duplicates.empty:
             with LoadingSpinner("Saving Duplicates Report..."):
                 with pd.ExcelWriter(dupe_path, engine='xlsxwriter') as writer:
-                    df_duplicates.to_excel(writer, index=False, sheet_name='Duplicates')
-            print(f"\n⚠️  Duplicates found! Report saved to: {dupe_filename}")
-        else:
-            print("\n✅ No duplicates found.")
+                    df_duplicates.to_excel(writer, index=False)
+            print(f"   ⚠️  Duplicates report saved: {dupe_filename}")
 
-        print(f"🎉 Cleaned file saved to: {clean_filename}")
+        # --- STEP 2: PREP PARCEL LIST ---
+        with LoadingSpinner("Loading & Filtering Parcel List..."):
+            # Read header first
+            if parcel_path.lower().endswith('.csv'):
+                df_head = pd.read_csv(parcel_path, nrows=1)
+            else:
+                df_head = pd.read_excel(parcel_path, nrows=1)
+            
+            cols = [c.strip() for c in df_head.columns]
+            
+            # Map Columns
+            col_id = next((c for c in cols if c.upper() == 'FFRS SYSTEM GENERATED NO.'), None)
+            col_area = next((c for c in cols if c.upper() == 'CROP AREA'), None)
+            col_comm = next((c for c in cols if c.upper() == 'COMMODITY NAME'), None)
+            
+            if not all([col_id, col_area, col_comm]):
+                print("\n🛑 Error: Parcel file missing required columns.")
+                return
+
+            # Load Data
+            if parcel_path.lower().endswith('.csv'):
+                df_parcel = pd.read_csv(parcel_path, usecols=[col_id, col_area, col_comm])
+            else:
+                df_parcel = pd.read_excel(parcel_path, usecols=[col_id, col_area, col_comm])
+            
+            df_parcel.rename(columns={col_id:'KEY_ID', col_area:'CROP AREA', col_comm:'COMMODITY'}, inplace=True)
+
+            # Filter Commodity (Rice, Palay, Corn, Sugarcane)
+            mask = df_parcel['COMMODITY'].astype(str).str.contains(r'Rice|Palay|Corn|Sugarcane', flags=re.IGNORECASE, regex=True)
+            df_parcel = df_parcel[mask]
+            
+            # IMPORTANT: We DO NOT dedupe Parcel ID yet. 
+            # We need all parcels to match correct commodity.
+
+        print(f"   Parcel List References: {len(df_parcel)} (Rice/Corn/Sugar)")
+
+        # --- STEP 3: MERGE & COMMODITY MATCH ---
+        with LoadingSpinner("Merging & Matching Commodities..."):
+            # 1. Merge (This expands rows 1-to-Many)
+            df_merged = pd.merge(
+                df_clean_geo,
+                df_parcel, # Contains KEY_ID, CROP AREA, COMMODITY (y)
+                left_on='RSBSA ID',
+                right_on='KEY_ID',
+                how='left',
+                suffixes=('', '_parcel')
+            )
+            
+            # 2. Calculate Match Score
+            # If Geo Commodity (Rice) matches Parcel Commodity (Palay) -> 1, else 0
+            def is_match(row):
+                if pd.isna(row['COMMODITY_parcel']): return False
+                return normalize_commodity(row['COMMODITY']) == normalize_commodity(row['COMMODITY_parcel'])
+            
+            df_merged['is_match'] = df_merged.apply(is_match, axis=1)
+            
+            # 3. Sort: Prioritize Matches, then whatever else
+            df_merged.sort_values(by=['GEOREF ID', 'is_match'], ascending=[True, False], inplace=True)
+            
+            # 4. Dedupe: Keep best match per GEOREF ID
+            df_final = df_merged.drop_duplicates(subset=['GEOREF ID'], keep='first').copy()
+            
+            # 5. Validate Crop Area based on Match
+            def finalize_crop_area(row):
+                if pd.isna(row['KEY_ID']): return "ID NOT FOUND"
+                if not row['is_match']: return "COMMODITY MISMATCH"
+                return row['CROP AREA']
+            
+            df_final['CROP AREA'] = df_final.apply(finalize_crop_area, axis=1)
+
+        # --- STEP 4: FINDINGS & REARRANGE ---
+        with LoadingSpinner("Calculating Findings..."):
+            def calc_findings(row):
+                crop_val = row['CROP AREA']
+                ver_val = row['VERIFIED AREA (Ha)']
+                
+                # Check if Crop Area is an error string
+                if isinstance(crop_val, str):
+                    return "NO CROP AREA"
+                if pd.isna(crop_val):
+                    return "NO CROP AREA"
+                
+                # Numeric Check
+                try:
+                    crop_num = float(crop_val)
+                    ver_num = float(ver_val)
+                    if ver_num > (crop_num + 2):
+                        return "ABOVE"
+                except:
+                    pass
+                
+                return "OK"
+
+            df_final['FINDINGS'] = df_final.apply(calc_findings, axis=1)
+            
+            # Rearrange
+            missing_final = [c for c in FINAL_COLUMN_ORDER if c not in df_final.columns]
+            if not missing_final:
+                df_final = df_final[FINAL_COLUMN_ORDER]
+            else:
+                print(f"   ⚠️ Warning: Could not rearrange columns. Missing: {missing_final}")
+
+        # --- STEP 5: SAVE ---
+        with LoadingSpinner(f"Saving result to {output_filename}..."):
+            with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+                df_final.to_excel(writer, index=False)
+
+        print(f"\n🎉 Success! File saved: {output_filename}")
 
     except Exception as e:
         print(f"❌ Critical Error: {e}")
@@ -339,7 +459,7 @@ def run_cli_app():
         print("   [1] Stack Rows (Strict Mode - Merge files with same columns)")
         print("   [2] Combine to Sheets (Group files into tabs)")
         print("   [3] Generate Regional Summary (Analytics per Barangay)")
-        print("   [4] Geotag Cleaner [Clean] (Deduplicate & Filter Columns)")
+        print("   [4] Geotag Processor (Clean & Add Crop Area)")
         print("   [Q] Quit")
         
         choice = input("\nSelect option: ").strip().upper()
@@ -353,11 +473,14 @@ def run_cli_app():
             if target_file:
                 process_rsbsa_report(target_file, output_dir)
         elif choice == "4":
-            print("\n--- Geotagger Accomplishment Cleaner ---")
-            print("This will filter columns and remove duplicate GEOREF IDs.")
-            target_file = select_input_file(input_dir)
-            if target_file:
-                process_geotag_cleaning(target_file, output_dir)
+            print("\n--- Geotag Processor ---")
+            print("This will: Clean duplicates -> Filter Columns -> Add CROP AREA from Parcel List")
+            
+            geo_file = select_input_file(input_dir, "1. Select Raw Geotag File")
+            if geo_file:
+                parcel_file = select_input_file(input_dir, "2. Select Parcel List File")
+                if parcel_file:
+                    process_unified_geotag(geo_file, parcel_file, output_dir)
         elif choice == "Q":
             sys.exit(0)
         else:
