@@ -281,6 +281,7 @@ def process_unified_geotag(geotag_path, parcel_path, output_dir):
     2. Preps Parcel (Filter Commodity, Dedupe ID)
     3. Merges (Adds CROP AREA) with Commodity Check
     4. Calculates FINDINGS
+    5. Summarizes VERIFIED AREA per UPLOADER
     """
     base_name = os.path.splitext(os.path.basename(geotag_path))[0]
     output_filename = f"{base_name} [clean_enriched].xlsx"
@@ -358,7 +359,6 @@ def process_unified_geotag(geotag_path, parcel_path, output_dir):
             df_parcel = df_parcel[mask]
             
             # IMPORTANT: We DO NOT dedupe Parcel ID yet. 
-            # We need all parcels to match correct commodity.
 
         print(f"   Parcel List References: {len(df_parcel)} (Rice/Corn/Sugar)")
 
@@ -375,7 +375,6 @@ def process_unified_geotag(geotag_path, parcel_path, output_dir):
             )
             
             # 2. Calculate Match Score
-            # If Geo Commodity (Rice) matches Parcel Commodity (Palay) -> 1, else 0
             def is_match(row):
                 if pd.isna(row['COMMODITY_parcel']): return False
                 return normalize_commodity(row['COMMODITY']) == normalize_commodity(row['COMMODITY_parcel'])
@@ -402,13 +401,11 @@ def process_unified_geotag(geotag_path, parcel_path, output_dir):
                 crop_val = row['CROP AREA']
                 ver_val = row['VERIFIED AREA (Ha)']
                 
-                # Check if Crop Area is an error string
                 if isinstance(crop_val, str):
                     return "NO CROP AREA"
                 if pd.isna(crop_val):
                     return "NO CROP AREA"
                 
-                # Numeric Check
                 try:
                     crop_num = float(crop_val)
                     ver_num = float(ver_val)
@@ -428,10 +425,38 @@ def process_unified_geotag(geotag_path, parcel_path, output_dir):
             else:
                 print(f"   ⚠️ Warning: Could not rearrange columns. Missing: {missing_final}")
 
-        # --- STEP 5: SAVE ---
+        # --- STEP 5: SUMMARIZE BY UPLOADER ---
+        with LoadingSpinner("Generating Uploader Summary..."):
+            # Ensure VERIFIED AREA is numeric for summing
+            df_final['VERIFIED AREA (Ha)'] = pd.to_numeric(df_final['VERIFIED AREA (Ha)'], errors='coerce').fillna(0)
+            
+            # Group and Sum
+            df_summary = df_final.groupby('UPLOADER')[['VERIFIED AREA (Ha)']].sum().reset_index()
+            df_summary = df_summary.rename(columns={'VERIFIED AREA (Ha)': 'TOTAL VERIFIED AREA (Ha)'})
+            df_summary = df_summary.sort_values('TOTAL VERIFIED AREA (Ha)', ascending=False)
+
+        # --- STEP 6: SAVE ---
         with LoadingSpinner(f"Saving result to {output_filename}..."):
             with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
-                df_final.to_excel(writer, index=False)
+                # 1. Write Summary Sheet (First)
+                df_summary.to_excel(writer, sheet_name='Uploader Summary', index=False)
+                
+                # Format Summary
+                workbook = writer.book
+                ws_summ = writer.sheets['Uploader Summary']
+                bold_fmt = workbook.add_format({'bold': True, 'bg_color': '#D9EAD3', 'border': 1})
+                num_fmt = workbook.add_format({'num_format': '#,##0.00', 'border': 1})
+                
+                # Header
+                for col_num, value in enumerate(df_summary.columns.values):
+                    ws_summ.write(0, col_num, value, bold_fmt)
+                
+                # Columns
+                ws_summ.set_column(0, 0, 35) # Uploader Name Width
+                ws_summ.set_column(1, 1, 25, num_fmt) # Area Width + Format
+                
+                # 2. Write Clean Data Sheet (Second)
+                df_final.to_excel(writer, sheet_name='Clean Data', index=False)
 
         print(f"\n🎉 Success! File saved: {output_filename}")
 
