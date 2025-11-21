@@ -72,7 +72,6 @@ def clear_screen():
 def print_header():
     print("="*70)
     print("   🌾  RSBSA TOOLBELT (Region 6)")
-    print("   Powered by XlsxWriter")
     print("="*70)
 
 class LoadingSpinner:
