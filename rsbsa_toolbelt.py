@@ -5,7 +5,9 @@ import re
 import time
 import threading
 import itertools
-from datetime import datetime
+import math
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
 
 # --- CONFIGURATION ---
 INPUT_FOLDER_NAME = "input_files"
@@ -143,11 +145,11 @@ def normalize_commodity(val):
     if 'SUGAR' in s: return 'SUGAR'
     return 'OTHER'
 
-def select_input_file(input_dir, prompt="Select file number to process"):
-    files = [f for f in os.listdir(input_dir) if f.lower().endswith(('.xlsx', '.csv')) and not f.startswith('~$')]
+def select_input_file(input_dir, prompt="Select file number to process", ext_filter=('.xlsx', '.csv')):
+    files = [f for f in os.listdir(input_dir) if f.lower().endswith(ext_filter) and not f.startswith('~$')]
     
     if not files:
-        print("❌ No valid files (.xlsx/.csv) found in input folder.")
+        print(f"❌ No valid files {ext_filter} found in input folder.")
         return None
 
     print("\nAvailable Files:")
@@ -159,6 +161,44 @@ def select_input_file(input_dir, prompt="Select file number to process"):
         if choice.isdigit() and 1 <= int(choice) <= len(files):
             return os.path.join(input_dir, files[int(choice)-1])
         print("❌ Invalid selection.")
+
+# --- GEOMETRY UTILS (GPX) ---
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """Calculate distance between two points in meters"""
+    R = 6371000  # Earth radius in meters
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+def calculate_polygon_area(lats, lons):
+    """
+    Calculate area of polygon in Hectares using Shoelace formula projected to meters.
+    """
+    if len(lats) < 3: return 0.0
+    
+    # Convert to approximate meters relative to first point (Local projection)
+    R = 6371000
+    lat0, lon0 = lats[0], lons[0]
+    x = []
+    y = []
+    
+    for r_lat, r_lon in zip(lats, lons):
+        # y is lat distance
+        y.append(math.radians(r_lat - lat0) * R)
+        # x is lon distance adjusted by cos(lat)
+        x.append(math.radians(r_lon - lon0) * R * math.cos(math.radians(lat0)))
+    
+    # Shoelace formula
+    area = 0.0
+    j = len(x) - 1
+    for i in range(len(x)):
+        area += (x[j] + x[i]) * (y[j] - y[i])
+        j = i
+    
+    area_sqm = abs(area / 2.0)
+    return area_sqm / 10000.0  # Convert m2 to Hectares
 
 # --- MODE 3: RSBSA ANALYTICS ---
 
@@ -449,20 +489,17 @@ def process_unified_geotag(geotag_path, parcel_path, output_dir):
             # Ensure VERIFIED AREA is numeric
             df_final['VERIFIED AREA (Ha)'] = pd.to_numeric(df_final['VERIFIED AREA (Ha)'], errors='coerce').fillna(0)
             
-            # Create a helper column specifically for summing
-            # If Finding is OK, take Verified Area. Else, take 0.
+            # Helper col: sum only if OK
             df_final['sum_area'] = df_final.apply(
                 lambda x: x['VERIFIED AREA (Ha)'] if x['FINDINGS'] == 'OK' else 0, 
                 axis=1
             )
 
-            # Group by UPLOADER and sum the helper column
-            # This ensures ALL uploaders appear, even if they have 0 valid area
+            # Group by UPLOADER and sum
             df_summary = df_final.groupby('UPLOADER')[['sum_area']].sum().reset_index()
             df_summary = df_summary.rename(columns={'sum_area': 'TOTAL VERIFIED AREA (Ha)'})
             df_summary = df_summary.sort_values('TOTAL VERIFIED AREA (Ha)', ascending=False)
             
-            # Drop helper column so it doesn't show in the final file
             df_final.drop(columns=['sum_area'], inplace=True)
 
         # --- STEP 6: SAVE ---
@@ -490,6 +527,171 @@ def process_unified_geotag(geotag_path, parcel_path, output_dir):
     except Exception as e:
         print(f"❌ Critical Error: {e}")
 
+# --- MODE 5: GPX FIXER & ANALYZER ---
+
+def process_gpx_fixer(input_dir, output_dir):
+    """Scans .gpx files, validates, fixes missing tags, and exports Summary."""
+    
+    files = [f for f in os.listdir(input_dir) if f.lower().endswith('.gpx')]
+    
+    if not files:
+        print("❌ No .gpx files found.")
+        return
+
+    print(f"\n--- GPX Fixer & Processor ({len(files)} files) ---")
+    print("   Scanning for missing <ele> or <time> tags...")
+    
+    # Register Namespace to keep output clean
+    ET.register_namespace('', "http://www.topografix.com/GPX/1/1")
+    
+    summary_data = []
+    fixed_count = 0
+    
+    for filename in files:
+        file_path = os.path.join(input_dir, filename)
+        fixed_filename = f"{os.path.splitext(filename)[0]}[fixed].gpx"
+        fixed_path = os.path.join(output_dir, fixed_filename)
+        
+        try:
+            with LoadingSpinner(f"Processing {filename}..."):
+                tree = ET.parse(file_path)
+                root = tree.getroot()
+                
+                # Namespace handling
+                ns = {'gpx': 'http://www.topografix.com/GPX/1/1'}
+                
+                lats = []
+                lons = []
+                missing_tags = 0
+                points_fixed = 0
+                
+                # State for "Pattern" based fill
+                current_ele = 0.0  # Fallback default
+                current_time = datetime(2024, 1, 1, 8, 0, 0) # Fallback default
+                last_lat = None
+                last_lon = None
+                
+                # Find all trkpts
+                all_trkpts = []
+                for node in root.iter():
+                    if node.tag.endswith('trkpt'):
+                        all_trkpts.append(node)
+                        
+                if not all_trkpts:
+                    summary_data.append({'Filename': filename, 'Status': 'Error: No Points'})
+                    continue
+
+                for trkpt in all_trkpts:
+                    # 1. Get Geometry (Required for Distance Calc)
+                    try:
+                        lat = float(trkpt.attrib['lat'])
+                        lon = float(trkpt.attrib['lon'])
+                        lats.append(lat)
+                        lons.append(lon)
+                    except:
+                        continue # Skip corrupt points
+
+                    # 2. HANDLE ELEVATION (Pattern: Forward Fill)
+                    ele = trkpt.find('gpx:ele', ns)
+                    if ele is None: ele = trkpt.find('ele')
+                    
+                    if ele is not None and ele.text:
+                        try: current_ele = float(ele.text)
+                        except: pass
+                    else:
+                        # Missing: Fill with previous known value
+                        missing_tags += 1
+                        points_fixed += 1
+                        new_ele = ET.Element('ele')
+                        new_ele.text = f"{current_ele:.2f}"
+                        trkpt.append(new_ele)
+
+                    # 3. HANDLE TIME (Pattern: Physics-based Speed)
+                    time_tag = trkpt.find('gpx:time', ns)
+                    if time_tag is None: time_tag = trkpt.find('time')
+                    
+                    if time_tag is not None and time_tag.text:
+                        try:
+                            t_str = time_tag.text.replace('Z', '')
+                            # Handle potential variations in ISO format
+                            current_time = datetime.fromisoformat(t_str)
+                        except: pass
+                    else:
+                        # Missing: Calculate based on distance from last point
+                        if last_lat is not None:
+                            dist = haversine_distance(last_lat, last_lon, lat, lon)
+                            # Speed approx 1.5 m/s. Min 1 sec.
+                            seconds = max(1, int(dist / 1.5))
+                            current_time += timedelta(seconds=seconds)
+                        
+                        missing_tags += 1
+                        points_fixed += 1
+                        new_time = ET.Element('time')
+                        new_time.text = current_time.isoformat() + "Z"
+                        trkpt.append(new_time)
+
+                    # Update State
+                    last_lat = lat
+                    last_lon = lon
+
+                # Save Fixed File if needed
+                if points_fixed > 0:
+                    tree.write(fixed_path, encoding='UTF-8', xml_declaration=True)
+                    status = f"FIXED ({points_fixed} tags added)"
+                    fixed_count += 1
+                else:
+                    status = "OK"
+
+                # Calculate Area
+                area_ha = calculate_polygon_area(lats, lons)
+                
+                # Calculate Perimeter
+                dist_m = 0.0
+                if len(lats) > 1:
+                    for i in range(len(lats)-1):
+                        dist_m += haversine_distance(lats[i], lons[i], lats[i+1], lons[i+1])
+                    dist_m += haversine_distance(lats[-1], lons[-1], lats[0], lons[0])
+
+                summary_data.append({
+                    'Filename': filename,
+                    'Points': len(lats),
+                    'Fixes Applied': points_fixed,
+                    'Perimeter (m)': round(dist_m, 2),
+                    'Area (Ha)': round(area_ha, 4),
+                    'Status': status
+                })
+
+        except Exception as e:
+            summary_data.append({'Filename': filename, 'Status': f"Error: {str(e)}"})
+
+    # Save Summary
+    if summary_data:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        output_filename = f"GPX_Fix_Report_{timestamp}.xlsx"
+        output_path = os.path.join(output_dir, output_filename)
+        
+        df = pd.DataFrame(summary_data)
+        
+        with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+            df.to_excel(writer, index=False)
+            
+            # Highlight Fixed
+            workbook = writer.book
+            worksheet = writer.sheets['Sheet1']
+            yellow_fmt = workbook.add_format({'bg_color': '#FFF2CC', 'font_color': '#BF9000'})
+            
+            worksheet.conditional_format(1, 5, len(df), 5, {
+                'type': 'text',
+                'criteria': 'containing',
+                'value': 'FIXED',
+                'format': yellow_fmt
+            })
+            worksheet.set_column(0, 0, 40)
+            
+        print(f"\n🎉 Processed {len(files)} files.")
+        print(f"   files fixed: {fixed_count}")
+        print(f"   Report: {output_filename}")
+
 # --- MENU LOGIC ---
 
 def run_cli_app():
@@ -503,7 +705,7 @@ def run_cli_app():
 
     if just_created:
         print("\n✨ Setup complete.")
-        print(f"👉 Please copy your .xlsx/.csv files into '{INPUT_FOLDER_NAME}'")
+        print(f"👉 Please copy your files (.xlsx, .csv, .gpx) into '{INPUT_FOLDER_NAME}'")
         input("   Press Enter when you are ready...")
 
     while True:
@@ -512,6 +714,7 @@ def run_cli_app():
         print("   [2] Combine to Sheets (Group files into tabs)")
         print("   [3] Generate Regional Summary (Analytics per Barangay)")
         print("   [4] Geotag Processor (Clean & Add Crop Area)")
+        print("   [5] GPX Fixer & Calculator (Auto-add missing ele/time)")
         print("   [Q] Quit")
         
         choice = input("\nSelect option: ").strip().upper()
@@ -527,12 +730,13 @@ def run_cli_app():
         elif choice == "4":
             print("\n--- Geotag Processor ---")
             print("This will: Clean duplicates -> Filter Columns -> Add CROP AREA from Parcel List")
-            
-            geo_file = select_input_file(input_dir, "1. Select Raw Geotag File")
+            geo_file = select_input_file(input_dir, "1. Select Raw Geotag File", ('.xlsx', '.csv'))
             if geo_file:
-                parcel_file = select_input_file(input_dir, "2. Select Parcel List File")
+                parcel_file = select_input_file(input_dir, "2. Select Parcel List File", ('.xlsx', '.csv'))
                 if parcel_file:
                     process_unified_geotag(geo_file, parcel_file, output_dir)
+        elif choice == "5":
+            process_gpx_fixer(input_dir, output_dir)
         elif choice == "Q":
             sys.exit(0)
         else:
