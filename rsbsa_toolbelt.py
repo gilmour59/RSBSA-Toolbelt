@@ -540,9 +540,6 @@ def process_gpx_fixer(input_dir, output_dir):
     print(f"\n--- GPX Fixer & Processor ({len(files)} files) ---")
     print("   Scanning for missing <ele> or <time> tags...")
     
-    # Register Namespace to keep output clean
-    ET.register_namespace('', "http://www.topografix.com/GPX/1/1")
-    
     summary_data = []
     fixed_count = 0
     
@@ -553,11 +550,22 @@ def process_gpx_fixer(input_dir, output_dir):
         
         try:
             with LoadingSpinner(f"Processing {filename}..."):
+                
+                # --- DYNAMIC NAMESPACE PRESERVATION ---
+                # 1. Scan file to find used namespaces
+                events = ('start-ns',)
+                try:
+                    for event, (prefix, uri) in ET.iterparse(file_path, events):
+                        if not prefix: prefix = ''
+                        ET.register_namespace(prefix, uri)
+                except: pass # Continue even if iterparse has issues, default parsing might still work
+                
+                # 2. Parse Tree
                 tree = ET.parse(file_path)
                 root = tree.getroot()
                 
-                # Namespace handling
-                ns = {'gpx': 'http://www.topografix.com/GPX/1/1'}
+                # Namespace map for searching (Generic fallback)
+                ns_map = {'gpx': 'http://www.topografix.com/GPX/1/1'}
                 
                 lats = []
                 lons = []
@@ -565,12 +573,12 @@ def process_gpx_fixer(input_dir, output_dir):
                 points_fixed = 0
                 
                 # State for "Pattern" based fill
-                current_ele = 0.0  # Fallback default
-                current_time = datetime(2024, 1, 1, 8, 0, 0) # Fallback default
+                current_ele = 0.0 
+                current_time = datetime(2024, 1, 1, 8, 0, 0)
                 last_lat = None
                 last_lon = None
                 
-                # Find all trkpts
+                # Robust search for all trkpts (ignoring namespace prefixes in search)
                 all_trkpts = []
                 for node in root.iter():
                     if node.tag.endswith('trkpt'):
@@ -581,45 +589,48 @@ def process_gpx_fixer(input_dir, output_dir):
                     continue
 
                 for trkpt in all_trkpts:
-                    # 1. Get Geometry (Required for Distance Calc)
+                    # 1. Get Geometry
                     try:
                         lat = float(trkpt.attrib['lat'])
                         lon = float(trkpt.attrib['lon'])
                         lats.append(lat)
                         lons.append(lon)
                     except:
-                        continue # Skip corrupt points
+                        continue 
 
-                    # 2. HANDLE ELEVATION (Pattern: Forward Fill)
-                    ele = trkpt.find('gpx:ele', ns)
-                    if ele is None: ele = trkpt.find('ele')
+                    # 2. HANDLE ELEVATION (Forward Fill Pattern)
+                    # Try finding ele with known namespaces or just tag name
+                    ele = None
+                    for child in trkpt:
+                        if child.tag.endswith('ele'):
+                            ele = child
+                            break
                     
                     if ele is not None and ele.text:
                         try: current_ele = float(ele.text)
                         except: pass
                     else:
-                        # Missing: Fill with previous known value
                         missing_tags += 1
                         points_fixed += 1
                         new_ele = ET.Element('ele')
                         new_ele.text = f"{current_ele:.2f}"
                         trkpt.append(new_ele)
 
-                    # 3. HANDLE TIME (Pattern: Physics-based Speed)
-                    time_tag = trkpt.find('gpx:time', ns)
-                    if time_tag is None: time_tag = trkpt.find('time')
+                    # 3. HANDLE TIME (Distance-based Speed Pattern)
+                    time_tag = None
+                    for child in trkpt:
+                        if child.tag.endswith('time'):
+                            time_tag = child
+                            break
                     
                     if time_tag is not None and time_tag.text:
                         try:
                             t_str = time_tag.text.replace('Z', '')
-                            # Handle potential variations in ISO format
                             current_time = datetime.fromisoformat(t_str)
                         except: pass
                     else:
-                        # Missing: Calculate based on distance from last point
                         if last_lat is not None:
                             dist = haversine_distance(last_lat, last_lon, lat, lon)
-                            # Speed approx 1.5 m/s. Min 1 sec.
                             seconds = max(1, int(dist / 1.5))
                             current_time += timedelta(seconds=seconds)
                         
@@ -629,11 +640,10 @@ def process_gpx_fixer(input_dir, output_dir):
                         new_time.text = current_time.isoformat() + "Z"
                         trkpt.append(new_time)
 
-                    # Update State
                     last_lat = lat
                     last_lon = lon
 
-                # Save Fixed File if needed
+                # Save Fixed File
                 if points_fixed > 0:
                     tree.write(fixed_path, encoding='UTF-8', xml_declaration=True)
                     status = f"FIXED ({points_fixed} tags added)"
@@ -641,10 +651,9 @@ def process_gpx_fixer(input_dir, output_dir):
                 else:
                     status = "OK"
 
-                # Calculate Area
+                # Calculate Stats
                 area_ha = calculate_polygon_area(lats, lons)
                 
-                # Calculate Perimeter
                 dist_m = 0.0
                 if len(lats) > 1:
                     for i in range(len(lats)-1):
@@ -674,7 +683,6 @@ def process_gpx_fixer(input_dir, output_dir):
         with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
             df.to_excel(writer, index=False)
             
-            # Highlight Fixed
             workbook = writer.book
             worksheet = writer.sheets['Sheet1']
             yellow_fmt = workbook.add_format({'bg_color': '#FFF2CC', 'font_color': '#BF9000'})
@@ -690,56 +698,6 @@ def process_gpx_fixer(input_dir, output_dir):
         print(f"\n🎉 Processed {len(files)} files.")
         print(f"   files fixed: {fixed_count}")
         print(f"   Report: {output_filename}")
-
-# --- MENU LOGIC ---
-
-def run_cli_app():
-    clear_screen()
-    print_header()
-
-    input_dir, output_dir, just_created = ensure_directories()
-    
-    print(f"\n📍 Looking for files in: ./{INPUT_FOLDER_NAME}")
-    print(f"📍 Saving results to:    ./{OUTPUT_FOLDER_NAME}")
-
-    if just_created:
-        print("\n✨ Setup complete.")
-        print(f"👉 Please copy your files (.xlsx, .csv, .gpx) into '{INPUT_FOLDER_NAME}'")
-        input("   Press Enter when you are ready...")
-
-    while True:
-        print("\nSelect Operation:")
-        print("   [1] Stack Rows (Strict Mode - Merge files with same columns)")
-        print("   [2] Combine to Sheets (Group files into tabs)")
-        print("   [3] Generate Regional Summary (Analytics per Barangay)")
-        print("   [4] Geotag Processor (Clean & Add Crop Area)")
-        print("   [5] GPX Fixer & Calculator (Auto-add missing ele/time)")
-        print("   [Q] Quit")
-        
-        choice = input("\nSelect option: ").strip().upper()
-
-        if choice == "1":
-            run_stack_rows(input_dir, output_dir)
-        elif choice == "2":
-            run_combine_sheets(input_dir, output_dir)
-        elif choice == "3":
-            target_file = select_input_file(input_dir)
-            if target_file:
-                process_rsbsa_report(target_file, output_dir)
-        elif choice == "4":
-            print("\n--- Geotag Processor ---")
-            print("This will: Clean duplicates -> Filter Columns -> Add CROP AREA from Parcel List")
-            geo_file = select_input_file(input_dir, "1. Select Raw Geotag File", ('.xlsx', '.csv'))
-            if geo_file:
-                parcel_file = select_input_file(input_dir, "2. Select Parcel List File", ('.xlsx', '.csv'))
-                if parcel_file:
-                    process_unified_geotag(geo_file, parcel_file, output_dir)
-        elif choice == "5":
-            process_gpx_fixer(input_dir, output_dir)
-        elif choice == "Q":
-            sys.exit(0)
-        else:
-            print("Invalid selection.")
 
 # --- RE-INCLUDED HELPER FUNCTIONS FOR MODES 1 & 2 ---
 def run_stack_rows(input_dir, output_dir):
@@ -799,6 +757,56 @@ def run_combine_sheets(input_dir, output_dir):
                 print(f"✅ Added: {filename}")
             except: pass
     print(f"🎉 Saved: {path}")
+
+# --- MENU LOGIC ---
+
+def run_cli_app():
+    clear_screen()
+    print_header()
+
+    input_dir, output_dir, just_created = ensure_directories()
+    
+    print(f"\n📍 Looking for files in: ./{INPUT_FOLDER_NAME}")
+    print(f"📍 Saving results to:    ./{OUTPUT_FOLDER_NAME}")
+
+    if just_created:
+        print("\n✨ Setup complete.")
+        print(f"👉 Please copy your files (.xlsx, .csv, .gpx) into '{INPUT_FOLDER_NAME}'")
+        input("   Press Enter when you are ready...")
+
+    while True:
+        print("\nSelect Operation:")
+        print("   [1] Stack Rows (Strict Mode - Merge files with same columns)")
+        print("   [2] Combine to Sheets (Group files into tabs)")
+        print("   [3] Generate Regional Summary (Analytics per Barangay)")
+        print("   [4] Geotag Processor (Clean & Add Crop Area)")
+        print("   [5] GPX Fixer & Calculator (Auto-add missing ele/time)")
+        print("   [Q] Quit")
+        
+        choice = input("\nSelect option: ").strip().upper()
+
+        if choice == "1":
+            run_stack_rows(input_dir, output_dir)
+        elif choice == "2":
+            run_combine_sheets(input_dir, output_dir)
+        elif choice == "3":
+            target_file = select_input_file(input_dir)
+            if target_file:
+                process_rsbsa_report(target_file, output_dir)
+        elif choice == "4":
+            print("\n--- Geotag Processor ---")
+            print("This will: Clean duplicates -> Filter Columns -> Add CROP AREA from Parcel List")
+            geo_file = select_input_file(input_dir, "1. Select Raw Geotag File", ('.xlsx', '.csv'))
+            if geo_file:
+                parcel_file = select_input_file(input_dir, "2. Select Parcel List File", ('.xlsx', '.csv'))
+                if parcel_file:
+                    process_unified_geotag(geo_file, parcel_file, output_dir)
+        elif choice == "5":
+            process_gpx_fixer(input_dir, output_dir)
+        elif choice == "Q":
+            sys.exit(0)
+        else:
+            print("Invalid selection.")
 
 if __name__ == "__main__":
     try:
