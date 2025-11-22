@@ -72,6 +72,7 @@ def clear_screen():
 def print_header():
     print("="*70)
     print("   🌾  RSBSA TOOLBELT (Region 6)")
+    print("   Powered by XlsxWriter")
     print("="*70)
 
 class LoadingSpinner:
@@ -540,6 +541,9 @@ def process_gpx_fixer(input_dir, output_dir):
     print(f"\n--- GPX Fixer & Processor ({len(files)} files) ---")
     print("   Scanning for missing <ele> or <time> tags...")
     
+    # --- DYNAMIC NAMESPACE PRESERVATION (REMOVED HARDCODED LIST) ---
+    # This allows the script to be version-agnostic. It will learn from the file.
+    
     summary_data = []
     fixed_count = 0
     
@@ -551,21 +555,20 @@ def process_gpx_fixer(input_dir, output_dir):
         try:
             with LoadingSpinner(f"Processing {filename}..."):
                 
-                # --- DYNAMIC NAMESPACE PRESERVATION ---
-                # 1. Scan file to find used namespaces
+                # 1. Scan file to find used namespaces (learns prefixes like gpxx, wptx1)
                 events = ('start-ns',)
                 try:
                     for event, (prefix, uri) in ET.iterparse(file_path, events):
                         if not prefix: prefix = ''
                         ET.register_namespace(prefix, uri)
-                except: pass # Continue even if iterparse has issues, default parsing might still work
+                except: pass 
                 
                 # 2. Parse Tree
                 tree = ET.parse(file_path)
                 root = tree.getroot()
                 
-                # Namespace map for searching (Generic fallback)
-                ns_map = {'gpx': 'http://www.topografix.com/GPX/1/1'}
+                # Namespace map for searching (generic fallback, though iterparse handles writing)
+                ns = {'gpx': 'http://www.topografix.com/GPX/1/1'}
                 
                 lats = []
                 lons = []
@@ -578,7 +581,7 @@ def process_gpx_fixer(input_dir, output_dir):
                 last_lat = None
                 last_lon = None
                 
-                # Robust search for all trkpts (ignoring namespace prefixes in search)
+                # Robust search for all trkpts
                 all_trkpts = []
                 for node in root.iter():
                     if node.tag.endswith('trkpt'):
@@ -599,7 +602,6 @@ def process_gpx_fixer(input_dir, output_dir):
                         continue 
 
                     # 2. HANDLE ELEVATION (Forward Fill Pattern)
-                    # Try finding ele with known namespaces or just tag name
                     ele = None
                     for child in trkpt:
                         if child.tag.endswith('ele'):
@@ -699,6 +701,133 @@ def process_gpx_fixer(input_dir, output_dir):
         print(f"   files fixed: {fixed_count}")
         print(f"   Report: {output_filename}")
 
+# --- MODE 6: CROSS-FILE AUDIT ---
+
+def process_cross_file_audit(input_dir, output_dir):
+    """
+    Scans all Excel files in input folder (Processed Files).
+    Filters rows where FINDINGS == 'OK'.
+    Checks for duplicate GEOREF IDs across the entire dataset.
+    Splits by Province.
+    """
+    files = [f for f in os.listdir(input_dir) if f.lower().endswith('.xlsx') and not f.startswith('~$')]
+    
+    if not files:
+        print("❌ No Excel files found to audit.")
+        return
+
+    print("\n--- Cross-File Audit (Cheating Detection) ---")
+    print(f"   Scanning {len(files)} files for duplicate GEOREF IDs among 'OK' entries...")
+
+    all_data = []
+    
+    # 1. Load All Data
+    for filename in files:
+        file_path = os.path.join(input_dir, filename)
+        try:
+            with LoadingSpinner(f"Reading {filename}..."):
+                # We expect columns from Mode 4 output, specifically GEOREF ID, PROVINCE, FINDINGS, UPLOADER
+                # Load potentially large files, so read relevant cols if possible, or all if unsure
+                df = pd.read_excel(file_path)
+                
+                # Normalize columns
+                df.columns = [c.strip().upper() for c in df.columns]
+                
+                # Check minimum requirements
+                if 'GEOREF ID' not in df.columns or 'PROVINCE' not in df.columns:
+                    continue # Skip files that aren't Mode 4 outputs
+                
+                # Filter for OK Findings (if column exists, otherwise take all)
+                if 'FINDINGS' in df.columns:
+                    df = df[df['FINDINGS'] == 'OK']
+                
+                # Tag source
+                df['SOURCE_FILE'] = filename
+                all_data.append(df)
+                
+        except Exception as e:
+            print(f"   ⚠️ Error reading {filename}: {e}")
+
+    if not all_data:
+        print("❌ No valid data found to audit.")
+        return
+
+    # 2. Consolidate
+    print("   Consolidating data...")
+    full_df = pd.concat(all_data, ignore_index=True)
+    
+    if full_df.empty:
+        print("   No 'OK' rows found to audit.")
+        return
+
+    # 3. Find Duplicates
+    print("   Analyzing duplicates...")
+    # Mark all duplicates (keep=False) so we see every instance of the cheating
+    dupe_mask = full_df.duplicated(subset=['GEOREF ID'], keep=False)
+    df_duplicates = full_df[dupe_mask].sort_values(['PROVINCE', 'GEOREF ID'])
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    output_filename = f"Cross_File_Audit_Report_{timestamp}.xlsx"
+    output_path = os.path.join(output_dir, output_filename)
+
+    # 4. Save Report
+    try:
+        with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+            
+            # SHEET 1: SUMMARY
+            summary_list = []
+            if not df_duplicates.empty:
+                # Count duplicates per province
+                prov_counts = df_duplicates.groupby('PROVINCE')['GEOREF ID'].nunique().reset_index()
+                prov_counts.columns = ['Province', 'Unique Duplicate IDs']
+                
+                # Count involved uploaders
+                uploader_counts = df_duplicates.groupby('UPLOADER')['GEOREF ID'].count().reset_index()
+                uploader_counts.columns = ['Uploader', 'Total Duplicate Entries']
+                uploader_counts = uploader_counts.sort_values('Total Duplicate Entries', ascending=False)
+                
+                # Write to sheet
+                prov_counts.to_excel(writer, sheet_name='Audit Summary', startrow=0, index=False)
+                uploader_counts.to_excel(writer, sheet_name='Audit Summary', startrow=len(prov_counts)+3, index=False)
+                
+                workbook = writer.book
+                ws = writer.sheets['Audit Summary']
+                bold = workbook.add_format({'bold': True})
+                ws.write(len(prov_counts)+2, 0, "Top Offenders (Uploaders)", bold)
+                ws.set_column(0, 1, 25)
+            else:
+                pd.DataFrame({'Status': ['CLEAN - No Cross-File Duplicates Found']}).to_excel(writer, sheet_name='Audit Summary', index=False)
+
+            # SHEET 2+: PROVINCE DETAILS
+            if not df_duplicates.empty:
+                # Group by Province for separate sheets
+                grouped = df_duplicates.groupby('PROVINCE')
+                for province, group in grouped:
+                    # Clean sheet name
+                    safe_name = clean_sheet_name(str(province))
+                    
+                    # Select relevant cols
+                    audit_cols = ['GEOREF ID', 'UPLOADER', 'SOURCE_FILE', 'VERIFIED AREA (HA)', 'TRACK DATE']
+                    # Use intersection to avoid key errors if cols missing
+                    cols_to_use = [c for c in audit_cols if c in group.columns]
+                    
+                    group[cols_to_use].to_excel(writer, sheet_name=safe_name, index=False)
+                    
+                    # Formatting
+                    ws = writer.sheets[safe_name]
+                    ws.set_column(0, 0, 25) # Georef
+                    ws.set_column(1, 2, 30) # Uploader/File
+
+        print(f"\n🎉 Audit Complete!")
+        if df_duplicates.empty:
+            print("   ✅ CLEAN: No duplicates found across files.")
+        else:
+            print(f"   ⚠️  FOUND {len(df_duplicates)} duplicate entries!")
+            print(f"   Report saved to: {output_filename}")
+
+    except Exception as e:
+        print(f"❌ Save Error: {e}")
+
 # --- RE-INCLUDED HELPER FUNCTIONS FOR MODES 1 & 2 ---
 def run_stack_rows(input_dir, output_dir):
     try:
@@ -781,6 +910,7 @@ def run_cli_app():
         print("   [3] Generate Regional Summary (Analytics per Barangay)")
         print("   [4] Geotag Processor (Clean & Add Crop Area)")
         print("   [5] GPX Fixer & Calculator (Auto-add missing ele/time)")
+        print("   [6] Cross-File Audit (Detect Cheating/Duplicates across files)")
         print("   [Q] Quit")
         
         choice = input("\nSelect option: ").strip().upper()
@@ -803,6 +933,8 @@ def run_cli_app():
                     process_unified_geotag(geo_file, parcel_file, output_dir)
         elif choice == "5":
             process_gpx_fixer(input_dir, output_dir)
+        elif choice == "6":
+            process_cross_file_audit(input_dir, output_dir)
         elif choice == "Q":
             sys.exit(0)
         else:
