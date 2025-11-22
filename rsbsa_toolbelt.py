@@ -318,390 +318,226 @@ def process_rsbsa_report(file_path, output_dir):
     except Exception as e:
         print(f"❌ Critical Error: {e}")
 
-# --- MODE 4: UNIFIED GEOTAG (CLEAN + ENRICH) ---
+# --- MODE 4: UNIFIED GEOTAG (BATCH/SINGLE + ENRICH) ---
 
-def process_unified_geotag(geotag_path, parcel_path, output_dir):
-    """
-    1. Cleans Geotag (Dedupe GEOREF ID, Filter Columns)
-    2. Preps Parcel (Filter Commodity, Dedupe ID)
-    3. Merges (Adds CROP AREA) with Commodity Check
-    4. Checks TRACK DATE
-    5. Calculates FINDINGS
-    6. Summarizes VERIFIED AREA per UPLOADER (Only if OK)
-    """
+def load_parcel_reference(parcel_path):
+    """Loads and filters the Parcel List DataFrame."""
+    with LoadingSpinner("Loading & Filtering Parcel List..."):
+        # Read header first
+        if parcel_path.lower().endswith('.csv'):
+            df_head = pd.read_csv(parcel_path, nrows=1)
+        else:
+            df_head = pd.read_excel(parcel_path, nrows=1)
+        
+        cols = [c.strip() for c in df_head.columns]
+        
+        # Map Columns
+        col_id = next((c for c in cols if c.upper() == 'FFRS SYSTEM GENERATED NO.'), None)
+        col_area = next((c for c in cols if c.upper() == 'CROP AREA'), None)
+        col_comm = next((c for c in cols if c.upper() == 'COMMODITY NAME'), None)
+        
+        # Determine Province Column in Parcel List
+        # Usually "FARMER ADDRESS 3" or "PROVINCE"
+        col_prov = next((c for c in cols if c.upper() in ['PROVINCE', 'FARMER ADDRESS 3']), None)
+        
+        if not all([col_id, col_area, col_comm]):
+            return None, None
+        
+        # Load Data
+        usecols = [col_id, col_area, col_comm]
+        if col_prov: usecols.append(col_prov)
+        
+        if parcel_path.lower().endswith('.csv'):
+            df_parcel = pd.read_csv(parcel_path, usecols=usecols)
+        else:
+            df_parcel = pd.read_excel(parcel_path, usecols=usecols)
+        
+        rename_map = {col_id:'KEY_ID', col_area:'CROP AREA', col_comm:'COMMODITY'}
+        if col_prov: rename_map[col_prov] = 'PROVINCE'
+        
+        df_parcel.rename(columns=rename_map, inplace=True)
+
+        # Determine Master Province (Most common value)
+        master_province = None
+        if 'PROVINCE' in df_parcel.columns:
+            master_province = df_parcel['PROVINCE'].mode()[0].strip().upper()
+
+        # Filter Commodity
+        mask = df_parcel['COMMODITY'].astype(str).str.contains(r'Rice|Palay|Corn|Sugarcane', flags=re.IGNORECASE, regex=True)
+        df_parcel = df_parcel[mask]
+        
+        return df_parcel, master_province
+
+def process_single_geotag_logic(geotag_path, df_parcel, master_province, output_dir):
+    """Core logic for cleaning/enriching a single geotag file against loaded parcel data."""
     base_name = os.path.splitext(os.path.basename(geotag_path))[0]
     output_filename = f"{base_name} [clean_enriched].xlsx"
     dupe_filename = f"{base_name} [duplicates].xlsx"
     output_path = os.path.join(output_dir, output_filename)
     dupe_path = os.path.join(output_dir, dupe_filename)
 
-    print("\n--- Geotag Cleaning & Enrichment ---")
-    print(f"   1. Target File: {os.path.basename(geotag_path)}")
-    print(f"   2. Source File: {os.path.basename(parcel_path)}")
-
     try:
-        # --- STEP 1: LOAD & CLEAN GEOTAG ---
-        with LoadingSpinner("Loading & Cleaning Geotag file..."):
-            if geotag_path.lower().endswith('.csv'):
-                df_geo = pd.read_csv(geotag_path)
-            else:
-                df_geo = pd.read_excel(geotag_path)
-            
-            # Normalize & Check
-            df_geo.columns = [c.strip() for c in df_geo.columns]
-            missing = [c for c in TARGET_COLS_GEOTAG if c not in df_geo.columns]
-            if missing:
-                print(f"\n🛑 Error: Geotag file missing columns: {missing}")
+        # LOAD GEOTAG
+        if geotag_path.lower().endswith('.csv'):
+            df_geo = pd.read_csv(geotag_path)
+        else:
+            df_geo = pd.read_excel(geotag_path)
+        
+        df_geo.columns = [c.strip() for c in df_geo.columns]
+        missing = [c for c in TARGET_COLS_GEOTAG if c not in df_geo.columns]
+        if missing:
+            print(f"   ⚠️  Skipping {base_name}: Missing columns {missing}")
+            return
+
+        # PROVINCE CHECK
+        if master_province:
+            # Get mode of province in this file
+            geo_prov = df_geo['PROVINCE'].mode()[0].strip().upper()
+            if geo_prov != master_province:
+                print(f"   🛑 Skipped {base_name}: Province mismatch (File: {geo_prov} != Parcel: {master_province})")
                 return
 
-            # Filter Columns
-            df_geo = df_geo[TARGET_COLS_GEOTAG].copy()
+        # Filter Columns
+        df_geo = df_geo[TARGET_COLS_GEOTAG].copy()
 
-            # Deduplicate GEOREF ID
-            dupe_mask = df_geo.duplicated(subset=['GEOREF ID'], keep=False)
-            df_duplicates = df_geo[dupe_mask].sort_values('GEOREF ID')
-            
-            # Keep First unique
-            df_clean_geo = df_geo.drop_duplicates(subset=['GEOREF ID'], keep='first')
+        # Deduplicate GEOREF ID
+        dupe_mask = df_geo.duplicated(subset=['GEOREF ID'], keep=False)
+        df_duplicates = df_geo[dupe_mask].sort_values('GEOREF ID')
+        df_clean_geo = df_geo.drop_duplicates(subset=['GEOREF ID'], keep='first')
 
-        print(f"   Geotag Rows: {len(df_geo)} -> {len(df_clean_geo)} (Removed {len(df_geo)-len(df_clean_geo)} duplicates)")
-
-        # Save Duplicates Report if exist
         if not df_duplicates.empty:
-            with LoadingSpinner("Saving Duplicates Report..."):
-                with pd.ExcelWriter(dupe_path, engine='xlsxwriter') as writer:
-                    df_duplicates.to_excel(writer, index=False)
-            print(f"   ⚠️  Duplicates report saved: {dupe_filename}")
+            with pd.ExcelWriter(dupe_path, engine='xlsxwriter') as writer:
+                df_duplicates.to_excel(writer, index=False)
 
-        # --- STEP 2: PREP PARCEL LIST ---
-        with LoadingSpinner("Loading & Filtering Parcel List..."):
-            # Read header first
-            if parcel_path.lower().endswith('.csv'):
-                df_head = pd.read_csv(parcel_path, nrows=1)
-            else:
-                df_head = pd.read_excel(parcel_path, nrows=1)
-            
-            cols = [c.strip() for c in df_head.columns]
-            
-            # Map Columns
-            col_id = next((c for c in cols if c.upper() == 'FFRS SYSTEM GENERATED NO.'), None)
-            col_area = next((c for c in cols if c.upper() == 'CROP AREA'), None)
-            col_comm = next((c for c in cols if c.upper() == 'COMMODITY NAME'), None)
-            
-            if not all([col_id, col_area, col_comm]):
-                print("\n🛑 Error: Parcel file missing required columns.")
-                return
+        # MERGE
+        df_merged = pd.merge(
+            df_clean_geo,
+            df_parcel, 
+            left_on='RSBSA ID',
+            right_on='KEY_ID',
+            how='left',
+            suffixes=('', '_parcel')
+        )
+        
+        # MATCH
+        def is_match(row):
+            if pd.isna(row['COMMODITY_parcel']): return False
+            return normalize_commodity(row['COMMODITY']) == normalize_commodity(row['COMMODITY_parcel'])
+        
+        df_merged['is_match'] = df_merged.apply(is_match, axis=1)
+        df_merged.sort_values(by=['GEOREF ID', 'is_match'], ascending=[True, False], inplace=True)
+        df_final = df_merged.drop_duplicates(subset=['GEOREF ID'], keep='first').copy()
+        
+        def finalize_crop_area(row):
+            if pd.isna(row['KEY_ID']): return "ID NOT FOUND"
+            if not row['is_match']: return "COMMODITY MISMATCH"
+            return row['CROP AREA']
+        
+        df_final['CROP AREA'] = df_final.apply(finalize_crop_area, axis=1)
 
-            # Load Data
-            if parcel_path.lower().endswith('.csv'):
-                df_parcel = pd.read_csv(parcel_path, usecols=[col_id, col_area, col_comm])
-            else:
-                df_parcel = pd.read_excel(parcel_path, usecols=[col_id, col_area, col_comm])
-            
-            df_parcel.rename(columns={col_id:'KEY_ID', col_area:'CROP AREA', col_comm:'COMMODITY'}, inplace=True)
+        # FINDINGS
+        df_final['temp_track_dt'] = pd.to_datetime(df_final['TRACK DATE'], errors='coerce')
+        cutoff_date = pd.Timestamp("2024-01-01")
 
-            # Filter Commodity (Rice, Palay, Corn, Sugarcane)
-            mask = df_parcel['COMMODITY'].astype(str).str.contains(r'Rice|Palay|Corn|Sugarcane', flags=re.IGNORECASE, regex=True)
-            df_parcel = df_parcel[mask]
+        def calc_findings(row):
+            dt = row['temp_track_dt']
+            if pd.isna(dt) or dt < cutoff_date: return "INVALID DATE (< 2024)"
             
-            # We DO NOT dedupe Parcel ID yet to allow commodity checks.
+            crop_val = row['CROP AREA']
+            ver_val = row['VERIFIED AREA (Ha)']
+            if isinstance(crop_val, str) or pd.isna(crop_val): return "NO CROP AREA"
+            
+            try:
+                if float(ver_val) > (float(crop_val) + 2): return "ABOVE"
+            except: pass
+            return "OK"
 
-        print(f"   Parcel List References: {len(df_parcel)} (Rice/Corn/Sugar)")
+        df_final['FINDINGS'] = df_final.apply(calc_findings, axis=1)
+        df_final.drop(columns=['temp_track_dt'], inplace=True)
+        
+        # Rearrange
+        missing_final = [c for c in FINAL_COLUMN_ORDER if c not in df_final.columns]
+        if not missing_final: df_final = df_final[FINAL_COLUMN_ORDER]
 
-        # --- STEP 3: MERGE & COMMODITY MATCH ---
-        with LoadingSpinner("Merging & Matching Commodities..."):
-            # 1. Merge (This expands rows 1-to-Many)
-            df_merged = pd.merge(
-                df_clean_geo,
-                df_parcel, 
-                left_on='RSBSA ID',
-                right_on='KEY_ID',
-                how='left',
-                suffixes=('', '_parcel')
-            )
-            
-            # 2. Calculate Match Score
-            def is_match(row):
-                if pd.isna(row['COMMODITY_parcel']): return False
-                return normalize_commodity(row['COMMODITY']) == normalize_commodity(row['COMMODITY_parcel'])
-            
-            df_merged['is_match'] = df_merged.apply(is_match, axis=1)
-            
-            # 3. Sort: Prioritize Matches, then whatever else
-            df_merged.sort_values(by=['GEOREF ID', 'is_match'], ascending=[True, False], inplace=True)
-            
-            # 4. Dedupe: Keep best match per GEOREF ID
-            df_final = df_merged.drop_duplicates(subset=['GEOREF ID'], keep='first').copy()
-            
-            # 5. Validate Crop Area based on Match
-            def finalize_crop_area(row):
-                if pd.isna(row['KEY_ID']): return "ID NOT FOUND"
-                if not row['is_match']: return "COMMODITY MISMATCH"
-                return row['CROP AREA']
-            
-            df_final['CROP AREA'] = df_final.apply(finalize_crop_area, axis=1)
+        # SUMMARY
+        df_final['VERIFIED AREA (Ha)'] = pd.to_numeric(df_final['VERIFIED AREA (Ha)'], errors='coerce').fillna(0)
+        df_final['sum_area'] = df_final.apply(lambda x: x['VERIFIED AREA (Ha)'] if x['FINDINGS'] == 'OK' else 0, axis=1)
+        
+        df_summary = df_final.groupby('UPLOADER')[['sum_area']].sum().reset_index()
+        df_summary.rename(columns={'sum_area': 'TOTAL VERIFIED AREA (Ha)'}, inplace=True)
+        df_summary.sort_values('TOTAL VERIFIED AREA (Ha)', ascending=False, inplace=True)
+        
+        df_final.drop(columns=['sum_area'], inplace=True)
 
-        # --- STEP 4: FINDINGS & TRACK DATE CHECK ---
-        with LoadingSpinner("Calculating Findings..."):
+        # SAVE
+        with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+            df_summary.to_excel(writer, sheet_name='Uploader Summary', index=False)
             
-            # Pre-parse Track Date for speed
-            df_final['temp_track_dt'] = pd.to_datetime(df_final['TRACK DATE'], errors='coerce')
-            cutoff_date = pd.Timestamp("2024-01-01")
-
-            def calc_findings(row):
-                # 1. CHECK TRACK DATE
-                dt = row['temp_track_dt']
-                if pd.isna(dt) or dt < cutoff_date:
-                    return "INVALID DATE (< 2024)"
-
-                # 2. CHECK CROP AREA
-                crop_val = row['CROP AREA']
-                ver_val = row['VERIFIED AREA (Ha)']
-                
-                if isinstance(crop_val, str): # "ID NOT FOUND", "MISMATCH"
-                    return "NO CROP AREA"
-                if pd.isna(crop_val):
-                    return "NO CROP AREA"
-                
-                # 3. CHECK VARIANCE
-                try:
-                    crop_num = float(crop_val)
-                    ver_num = float(ver_val)
-                    if ver_num > (crop_num + 2):
-                        return "ABOVE"
-                except:
-                    pass
-                
-                return "OK"
-
-            df_final['FINDINGS'] = df_final.apply(calc_findings, axis=1)
-            df_final.drop(columns=['temp_track_dt'], inplace=True)
+            # Formatting
+            wb = writer.book
+            ws = writer.sheets['Uploader Summary']
+            bold = wb.add_format({'bold': True, 'bg_color': '#D9EAD3'})
+            num = wb.add_format({'num_format': '#,##0.00'})
+            for c, v in enumerate(df_summary.columns): ws.write(0, c, v, bold)
+            ws.set_column(0, 0, 35)
+            ws.set_column(1, 1, 25, num)
             
-            # Rearrange
-            missing_final = [c for c in FINAL_COLUMN_ORDER if c not in df_final.columns]
-            if not missing_final:
-                df_final = df_final[FINAL_COLUMN_ORDER]
-            else:
-                print(f"   ⚠️ Warning: Could not rearrange columns. Missing: {missing_final}")
+            df_final.to_excel(writer, sheet_name='Clean Data', index=False)
 
-        # --- STEP 5: SUMMARIZE BY UPLOADER ---
-        with LoadingSpinner("Generating Uploader Summary..."):
-            # Ensure VERIFIED AREA is numeric
-            df_final['VERIFIED AREA (Ha)'] = pd.to_numeric(df_final['VERIFIED AREA (Ha)'], errors='coerce').fillna(0)
-            
-            # Helper col: sum only if OK
-            df_final['sum_area'] = df_final.apply(
-                lambda x: x['VERIFIED AREA (Ha)'] if x['FINDINGS'] == 'OK' else 0, 
-                axis=1
-            )
-
-            # Group by UPLOADER and sum
-            df_summary = df_final.groupby('UPLOADER')[['sum_area']].sum().reset_index()
-            df_summary = df_summary.rename(columns={'sum_area': 'TOTAL VERIFIED AREA (Ha)'})
-            df_summary = df_summary.sort_values('TOTAL VERIFIED AREA (Ha)', ascending=False)
-            
-            df_final.drop(columns=['sum_area'], inplace=True)
-
-        # --- STEP 6: SAVE ---
-        with LoadingSpinner(f"Saving result to {output_filename}..."):
-            with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
-                # 1. Summary
-                df_summary.to_excel(writer, sheet_name='Uploader Summary', index=False)
-                
-                # Format Summary
-                workbook = writer.book
-                ws_summ = writer.sheets['Uploader Summary']
-                bold_fmt = workbook.add_format({'bold': True, 'bg_color': '#D9EAD3', 'border': 1})
-                num_fmt = workbook.add_format({'num_format': '#,##0.00', 'border': 1})
-                
-                for col_num, value in enumerate(df_summary.columns.values):
-                    ws_summ.write(0, col_num, value, bold_fmt)
-                ws_summ.set_column(0, 0, 35)
-                ws_summ.set_column(1, 1, 25, num_fmt)
-                
-                # 2. Clean Data
-                df_final.to_excel(writer, sheet_name='Clean Data', index=False)
-
-        print(f"\n🎉 Success! File saved: {output_filename}")
+        print(f"   ✅ Processed: {output_filename}")
 
     except Exception as e:
-        print(f"❌ Critical Error: {e}")
+        print(f"   ❌ Error processing {base_name}: {e}")
 
-# --- MODE 5: GPX FIXER & ANALYZER ---
+def run_mode_4_workflow(input_dir, output_dir):
+    print("\n--- Geotag Processor & Enricher ---")
+    print("   STEP 1: Select the MASTER PARCEL LIST")
+    parcel_path = select_input_file(input_dir, "Select Parcel List")
+    if not parcel_path: return
 
-def process_gpx_fixer(input_dir, output_dir):
-    """Scans .gpx files, validates, fixes missing tags, and exports Summary."""
+    # Load Parcel Data Once
+    df_parcel, master_province = load_parcel_reference(parcel_path)
+    if df_parcel is None:
+        print("❌ Error loading Parcel List.")
+        return
     
-    files = [f for f in os.listdir(input_dir) if f.lower().endswith('.gpx')]
+    if master_province:
+        print(f"   📍 Master Province Detected: {master_province}")
+    else:
+        print("   ⚠️  No Province column found in Parcel List. Skipping province safety check.")
+
+    print("\n   STEP 2: Select Target Geotag Files")
+    print("   [1] Select a single file")
+    print("   [2] BATCH PROCESS (All other files in folder)")
     
-    if not files:
-        print("❌ No .gpx files found.")
+    mode = input("\nSelect option: ").strip()
+    
+    files_to_process = []
+    
+    if mode == "1":
+        f = select_input_file(input_dir, "Select Geotag File")
+        if f: files_to_process.append(f)
+    elif mode == "2":
+        all_files = [os.path.join(input_dir, f) for f in os.listdir(input_dir) 
+                     if f.lower().endswith(('.xlsx', '.csv')) and not f.startswith('~$')]
+        # Exclude the parcel file itself
+        files_to_process = [f for f in all_files if os.path.abspath(f) != os.path.abspath(parcel_path)]
+        print(f"   Found {len(files_to_process)} files to process.")
+    else:
+        print("Invalid selection.")
         return
 
-    print(f"\n--- GPX Fixer & Processor ({len(files)} files) ---")
-    print("   Scanning for missing <ele> or <time> tags...")
+    if not files_to_process:
+        print("No files to process.")
+        return
+
+    print("\n--- Starting Batch Processing ---")
+    for geo_file in files_to_process:
+        process_single_geotag_logic(geo_file, df_parcel, master_province, output_dir)
     
-    # --- DYNAMIC NAMESPACE PRESERVATION (REMOVED HARDCODED LIST) ---
-    # This allows the script to be version-agnostic. It will learn from the file.
-    
-    summary_data = []
-    fixed_count = 0
-    
-    for filename in files:
-        file_path = os.path.join(input_dir, filename)
-        fixed_filename = f"{os.path.splitext(filename)[0]}[fixed].gpx"
-        fixed_path = os.path.join(output_dir, fixed_filename)
-        
-        try:
-            with LoadingSpinner(f"Processing {filename}..."):
-                
-                # 1. Scan file to find used namespaces (learns prefixes like gpxx, wptx1)
-                events = ('start-ns',)
-                try:
-                    for event, (prefix, uri) in ET.iterparse(file_path, events):
-                        if not prefix: prefix = ''
-                        ET.register_namespace(prefix, uri)
-                except: pass 
-                
-                # 2. Parse Tree
-                tree = ET.parse(file_path)
-                root = tree.getroot()
-                
-                # Namespace map for searching (generic fallback, though iterparse handles writing)
-                ns = {'gpx': 'http://www.topografix.com/GPX/1/1'}
-                
-                lats = []
-                lons = []
-                missing_tags = 0
-                points_fixed = 0
-                
-                # State for "Pattern" based fill
-                current_ele = 0.0 
-                current_time = datetime(2024, 1, 1, 8, 0, 0)
-                last_lat = None
-                last_lon = None
-                
-                # Robust search for all trkpts
-                all_trkpts = []
-                for node in root.iter():
-                    if node.tag.endswith('trkpt'):
-                        all_trkpts.append(node)
-                        
-                if not all_trkpts:
-                    summary_data.append({'Filename': filename, 'Status': 'Error: No Points'})
-                    continue
+    print("\n🎉 Batch Processing Complete!")
 
-                for trkpt in all_trkpts:
-                    # 1. Get Geometry
-                    try:
-                        lat = float(trkpt.attrib['lat'])
-                        lon = float(trkpt.attrib['lon'])
-                        lats.append(lat)
-                        lons.append(lon)
-                    except:
-                        continue 
-
-                    # 2. HANDLE ELEVATION (Forward Fill Pattern)
-                    ele = None
-                    for child in trkpt:
-                        if child.tag.endswith('ele'):
-                            ele = child
-                            break
-                    
-                    if ele is not None and ele.text:
-                        try: current_ele = float(ele.text)
-                        except: pass
-                    else:
-                        missing_tags += 1
-                        points_fixed += 1
-                        new_ele = ET.Element('ele')
-                        new_ele.text = f"{current_ele:.2f}"
-                        trkpt.append(new_ele)
-
-                    # 3. HANDLE TIME (Distance-based Speed Pattern)
-                    time_tag = None
-                    for child in trkpt:
-                        if child.tag.endswith('time'):
-                            time_tag = child
-                            break
-                    
-                    if time_tag is not None and time_tag.text:
-                        try:
-                            t_str = time_tag.text.replace('Z', '')
-                            current_time = datetime.fromisoformat(t_str)
-                        except: pass
-                    else:
-                        if last_lat is not None:
-                            dist = haversine_distance(last_lat, last_lon, lat, lon)
-                            seconds = max(1, int(dist / 1.5))
-                            current_time += timedelta(seconds=seconds)
-                        
-                        missing_tags += 1
-                        points_fixed += 1
-                        new_time = ET.Element('time')
-                        new_time.text = current_time.isoformat() + "Z"
-                        trkpt.append(new_time)
-
-                    last_lat = lat
-                    last_lon = lon
-
-                # Save Fixed File
-                if points_fixed > 0:
-                    tree.write(fixed_path, encoding='UTF-8', xml_declaration=True)
-                    status = f"FIXED ({points_fixed} tags added)"
-                    fixed_count += 1
-                else:
-                    status = "OK"
-
-                # Calculate Stats
-                area_ha = calculate_polygon_area(lats, lons)
-                
-                dist_m = 0.0
-                if len(lats) > 1:
-                    for i in range(len(lats)-1):
-                        dist_m += haversine_distance(lats[i], lons[i], lats[i+1], lons[i+1])
-                    dist_m += haversine_distance(lats[-1], lons[-1], lats[0], lons[0])
-
-                summary_data.append({
-                    'Filename': filename,
-                    'Points': len(lats),
-                    'Fixes Applied': points_fixed,
-                    'Perimeter (m)': round(dist_m, 2),
-                    'Area (Ha)': round(area_ha, 4),
-                    'Status': status
-                })
-
-        except Exception as e:
-            summary_data.append({'Filename': filename, 'Status': f"Error: {str(e)}"})
-
-    # Save Summary
-    if summary_data:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-        output_filename = f"GPX_Fix_Report_{timestamp}.xlsx"
-        output_path = os.path.join(output_dir, output_filename)
-        
-        df = pd.DataFrame(summary_data)
-        
-        with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
-            df.to_excel(writer, index=False)
-            
-            workbook = writer.book
-            worksheet = writer.sheets['Sheet1']
-            yellow_fmt = workbook.add_format({'bg_color': '#FFF2CC', 'font_color': '#BF9000'})
-            
-            worksheet.conditional_format(1, 5, len(df), 5, {
-                'type': 'text',
-                'criteria': 'containing',
-                'value': 'FIXED',
-                'format': yellow_fmt
-            })
-            worksheet.set_column(0, 0, 40)
-            
-        print(f"\n🎉 Processed {len(files)} files.")
-        print(f"   files fixed: {fixed_count}")
-        print(f"   Report: {output_filename}")
-
-# --- MODE 6: CROSS-FILE AUDIT ---
+# --- MODE 5: CROSS-FILE AUDIT ---
 
 def process_cross_file_audit(input_dir, output_dir):
     """
@@ -828,6 +664,164 @@ def process_cross_file_audit(input_dir, output_dir):
     except Exception as e:
         print(f"❌ Save Error: {e}")
 
+# --- MODE 6: GPX FIXER  ---
+
+def process_gpx_fixer(input_dir, output_dir):
+    """Scans .gpx files, validates, fixes missing tags, and exports Summary."""
+    
+    files = [f for f in os.listdir(input_dir) if f.lower().endswith('.gpx')]
+    
+    if not files:
+        print("❌ No .gpx files found.")
+        return
+
+    print(f"\n--- GPX Fixer & Processor ({len(files)} files) ---")
+    print("   Scanning for missing <ele> or <time> tags...")
+    
+    # --- DYNAMIC NAMESPACE PRESERVATION ---
+    ET.register_namespace('', "http://www.topografix.com/GPX/1/1")
+    
+    summary_data = []
+    fixed_count = 0
+    
+    for filename in files:
+        file_path = os.path.join(input_dir, filename)
+        fixed_filename = f"{os.path.splitext(filename)[0]}[fixed].gpx"
+        fixed_path = os.path.join(output_dir, fixed_filename)
+        
+        try:
+            with LoadingSpinner(f"Processing {filename}..."):
+                
+                # Scan file to find used namespaces
+                events = ('start-ns',)
+                try:
+                    for event, (prefix, uri) in ET.iterparse(file_path, events):
+                        if not prefix: prefix = ''
+                        ET.register_namespace(prefix, uri)
+                except: pass 
+                
+                tree = ET.parse(file_path)
+                root = tree.getroot()
+                
+                # Namespace map for searching
+                ns = {'gpx': 'http://www.topografix.com/GPX/1/1'}
+                
+                lats = []
+                lons = []
+                missing_tags = 0
+                points_fixed = 0
+                
+                current_ele = 0.0 
+                current_time = datetime(2024, 1, 1, 8, 0, 0)
+                last_lat = None
+                last_lon = None
+                
+                all_trkpts = []
+                for node in root.iter():
+                    if node.tag.endswith('trkpt'):
+                        all_trkpts.append(node)
+                        
+                if not all_trkpts:
+                    summary_data.append({'Filename': filename, 'Status': 'Error: No Points'})
+                    continue
+
+                for trkpt in all_trkpts:
+                    try:
+                        lat = float(trkpt.attrib['lat'])
+                        lon = float(trkpt.attrib['lon'])
+                        lats.append(lat)
+                        lons.append(lon)
+                    except:
+                        continue 
+
+                    ele = None
+                    for child in trkpt:
+                        if child.tag.endswith('ele'):
+                            ele = child
+                            break
+                    
+                    if ele is not None and ele.text:
+                        try: current_ele = float(ele.text)
+                        except: pass
+                    else:
+                        missing_tags += 1
+                        points_fixed += 1
+                        new_ele = ET.Element('ele')
+                        new_ele.text = f"{current_ele:.2f}"
+                        trkpt.append(new_ele)
+
+                    time_tag = None
+                    for child in trkpt:
+                        if child.tag.endswith('time'):
+                            time_tag = child
+                            break
+                    
+                    if time_tag is not None and time_tag.text:
+                        try:
+                            t_str = time_tag.text.replace('Z', '')
+                            current_time = datetime.fromisoformat(t_str)
+                        except: pass
+                    else:
+                        if last_lat is not None:
+                            dist = haversine_distance(last_lat, last_lon, lat, lon)
+                            seconds = max(1, int(dist / 1.5))
+                            current_time += timedelta(seconds=seconds)
+                        
+                        missing_tags += 1
+                        points_fixed += 1
+                        new_time = ET.Element('time')
+                        new_time.text = current_time.isoformat() + "Z"
+                        trkpt.append(new_time)
+
+                    last_lat = lat
+                    last_lon = lon
+
+                if points_fixed > 0:
+                    tree.write(fixed_path, encoding='UTF-8', xml_declaration=True)
+                    status = f"FIXED ({points_fixed} tags added)"
+                    fixed_count += 1
+                else:
+                    status = "OK"
+
+                area_ha = calculate_polygon_area(lats, lons)
+                
+                dist_m = 0.0
+                if len(lats) > 1:
+                    for i in range(len(lats)-1):
+                        dist_m += haversine_distance(lats[i], lons[i], lats[i+1], lons[i+1])
+                    dist_m += haversine_distance(lats[-1], lons[-1], lats[0], lons[0])
+
+                summary_data.append({
+                    'Filename': filename,
+                    'Points': len(lats),
+                    'Fixes Applied': points_fixed,
+                    'Perimeter (m)': round(dist_m, 2),
+                    'Area (Ha)': round(area_ha, 4),
+                    'Status': status
+                })
+
+        except Exception as e:
+            summary_data.append({'Filename': filename, 'Status': f"Error: {str(e)}"})
+
+    if summary_data:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        output_filename = f"GPX_Fix_Report_{timestamp}.xlsx"
+        output_path = os.path.join(output_dir, output_filename)
+        
+        df = pd.DataFrame(summary_data)
+        
+        with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+            df.to_excel(writer, index=False)
+            workbook = writer.book
+            worksheet = writer.sheets['Sheet1']
+            yellow_fmt = workbook.add_format({'bg_color': '#FFF2CC', 'font_color': '#BF9000'})
+            worksheet.conditional_format(1, 5, len(df), 5, {'type': 'text', 'criteria': 'containing', 'value': 'FIXED', 'format': yellow_fmt})
+            worksheet.set_column(0, 0, 40)
+            
+        print(f"\n🎉 Processed {len(files)} files.")
+        print(f"   files fixed: {fixed_count}")
+        print(f"   Report: {output_filename}")
+
 # --- RE-INCLUDED HELPER FUNCTIONS FOR MODES 1 & 2 ---
 def run_stack_rows(input_dir, output_dir):
     try:
@@ -909,8 +903,8 @@ def run_cli_app():
         print("   [2] Combine to Sheets (Group files into tabs)")
         print("   [3] Generate Regional Summary (Analytics per Barangay)")
         print("   [4] Geotag Processor (Clean & Add Crop Area)")
-        print("   [5] GPX Fixer & Calculator (Auto-add missing ele/time)")
-        print("   [6] Cross-File Audit (Detect Cheating/Duplicates across files)")
+        print("   [5] Cross-File Audit (Detect Cheating/Duplicates across files)")
+        print("   [6] GPX Fixer & Calculator (Auto-add missing ele/time)")
         print("   [Q] Quit")
         
         choice = input("\nSelect option: ").strip().upper()
@@ -924,17 +918,11 @@ def run_cli_app():
             if target_file:
                 process_rsbsa_report(target_file, output_dir)
         elif choice == "4":
-            print("\n--- Geotag Processor ---")
-            print("This will: Clean duplicates -> Filter Columns -> Add CROP AREA from Parcel List")
-            geo_file = select_input_file(input_dir, "1. Select Raw Geotag File", ('.xlsx', '.csv'))
-            if geo_file:
-                parcel_file = select_input_file(input_dir, "2. Select Parcel List File", ('.xlsx', '.csv'))
-                if parcel_file:
-                    process_unified_geotag(geo_file, parcel_file, output_dir)
+            run_mode_4_workflow(input_dir, output_dir)
         elif choice == "5":
-            process_gpx_fixer(input_dir, output_dir)
-        elif choice == "6":
             process_cross_file_audit(input_dir, output_dir)
+        elif choice == "6":
+            process_gpx_fixer(input_dir, output_dir)
         elif choice == "Q":
             sys.exit(0)
         else:
