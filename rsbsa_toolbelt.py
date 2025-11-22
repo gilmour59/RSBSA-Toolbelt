@@ -72,7 +72,6 @@ def clear_screen():
 def print_header():
     print("="*70)
     print("   🌾  RSBSA TOOLBELT (Region 6)")
-    print("   Powered by XlsxWriter")
     print("="*70)
 
 class LoadingSpinner:
@@ -337,7 +336,6 @@ def load_parcel_reference(parcel_path):
         col_comm = next((c for c in cols if c.upper() == 'COMMODITY NAME'), None)
         
         # Determine Province Column in Parcel List
-        # Usually "FARMER ADDRESS 3" or "PROVINCE"
         col_prov = next((c for c in cols if c.upper() in ['PROVINCE', 'FARMER ADDRESS 3']), None)
         
         if not all([col_id, col_area, col_comm]):
@@ -357,7 +355,7 @@ def load_parcel_reference(parcel_path):
         
         df_parcel.rename(columns=rename_map, inplace=True)
 
-        # Determine Master Province (Most common value)
+        # Determine Master Province
         master_province = None
         if 'PROVINCE' in df_parcel.columns:
             master_province = df_parcel['PROVINCE'].mode()[0].strip().upper()
@@ -391,7 +389,6 @@ def process_single_geotag_logic(geotag_path, df_parcel, master_province, output_
 
         # PROVINCE CHECK
         if master_province:
-            # Get mode of province in this file
             geo_prov = df_geo['PROVINCE'].mode()[0].strip().upper()
             if geo_prov != master_province:
                 print(f"   🛑 Skipped {base_name}: Province mismatch (File: {geo_prov} != Parcel: {master_province})")
@@ -410,9 +407,12 @@ def process_single_geotag_logic(geotag_path, df_parcel, master_province, output_
                 df_duplicates.to_excel(writer, index=False)
 
         # MERGE
+        # We do NOT need LAST_NAME here anymore as requested
+        merge_cols = ['KEY_ID', 'CROP AREA', 'COMMODITY']
+
         df_merged = pd.merge(
             df_clean_geo,
-            df_parcel, 
+            df_parcel[merge_cols], 
             left_on='RSBSA ID',
             right_on='KEY_ID',
             how='left',
@@ -457,7 +457,12 @@ def process_single_geotag_logic(geotag_path, df_parcel, master_province, output_
         
         # Rearrange
         missing_final = [c for c in FINAL_COLUMN_ORDER if c not in df_final.columns]
-        if not missing_final: df_final = df_final[FINAL_COLUMN_ORDER]
+        if not missing_final: 
+            df_final = df_final[FINAL_COLUMN_ORDER]
+            
+            # SORTING LOGIC: By Uploader, then GEOREF ID
+            if 'UPLOADER' in df_final.columns:
+                df_final.sort_values(by=['UPLOADER', 'GEOREF ID'], inplace=True)
 
         # SUMMARY
         df_final['VERIFIED AREA (Ha)'] = pd.to_numeric(df_final['VERIFIED AREA (Ha)'], errors='coerce').fillna(0)
@@ -841,6 +846,12 @@ def run_stack_rows(input_dir, output_dir):
             if filename.lower().endswith('.csv'): df = pd.read_csv(file_path)
             else: df = pd.read_excel(file_path)
             if not df.empty:
+                # SORTING LOGIC: Mode 1
+                # Check for 'last_name' or similar column to sort by
+                sort_col = next((c for c in df.columns if 'last' in c.lower() and 'name' in c.lower()), None)
+                if sort_col:
+                    df.sort_values(by=sort_col, inplace=True)
+                
                 df['Source_File'] = filename
                 merged_data.append(df)
                 print(f"✅ Buffered: {filename}")
