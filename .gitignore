@@ -4,3 +4,4 @@ venv
 build
 dist
 RSBSAToolbelt_Fast.spec
+.DS_Store

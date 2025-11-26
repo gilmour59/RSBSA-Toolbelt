@@ -338,6 +338,9 @@ def load_parcel_reference(parcel_path):
         # Determine Province Column in Parcel List
         col_prov = next((c for c in cols if c.upper() in ['PROVINCE', 'FARMER ADDRESS 3']), None)
         
+        # Attempt to find Last Name column for sorting
+        col_lname = next((c for c in cols if c.upper() == 'LAST NAME'), None)
+
         if not all([col_id, col_area, col_comm]):
             return None, None
         
@@ -669,7 +672,7 @@ def process_cross_file_audit(input_dir, output_dir):
     except Exception as e:
         print(f"❌ Save Error: {e}")
 
-# --- MODE 6: GPX FIXER  ---
+# --- MODE 6: GPX FIXER ---
 
 def process_gpx_fixer(input_dir, output_dir):
     """Scans .gpx files, validates, fixes missing tags, and exports Summary."""
@@ -717,9 +720,11 @@ def process_gpx_fixer(input_dir, output_dir):
                 points_fixed = 0
                 
                 current_ele = 0.0 
+                
+                # --- SEQUENTIAL RETIMING LOGIC START ---
+                # Default anchor if none found
                 current_time = datetime(2024, 1, 1, 8, 0, 0)
-                last_lat = None
-                last_lon = None
+                has_anchor = False
                 
                 all_trkpts = []
                 for node in root.iter():
@@ -730,7 +735,25 @@ def process_gpx_fixer(input_dir, output_dir):
                     summary_data.append({'Filename': filename, 'Status': 'Error: No Points'})
                     continue
 
+                # 1. Find Anchor (T0) from first valid timestamp
                 for trkpt in all_trkpts:
+                    time_tag = None
+                    for child in trkpt:
+                        if child.tag.endswith('time'):
+                            time_tag = child
+                            break
+                    
+                    if time_tag is not None and time_tag.text:
+                        try:
+                            t_str = time_tag.text.replace('Z', '')
+                            current_time = datetime.fromisoformat(t_str)
+                            has_anchor = True
+                            break # Found anchor
+                        except: pass
+                
+                # 2. Sequential Rewrite Loop (1Hz)
+                for i, trkpt in enumerate(all_trkpts):
+                    # Get Geometry
                     try:
                         lat = float(trkpt.attrib['lat'])
                         lon = float(trkpt.attrib['lon'])
@@ -739,6 +762,7 @@ def process_gpx_fixer(input_dir, output_dir):
                     except:
                         continue 
 
+                    # HANDLE ELEVATION (Forward Fill)
                     ele = None
                     for child in trkpt:
                         if child.tag.endswith('ele'):
@@ -755,35 +779,35 @@ def process_gpx_fixer(input_dir, output_dir):
                         new_ele.text = f"{current_ele:.2f}"
                         trkpt.append(new_ele)
 
+                    # HANDLE TIME (Strict 1Hz Sequential)
                     time_tag = None
                     for child in trkpt:
                         if child.tag.endswith('time'):
                             time_tag = child
                             break
                     
-                    if time_tag is not None and time_tag.text:
-                        try:
-                            t_str = time_tag.text.replace('Z', '')
-                            current_time = datetime.fromisoformat(t_str)
-                        except: pass
-                    else:
-                        if last_lat is not None:
-                            dist = haversine_distance(last_lat, last_lon, lat, lon)
-                            seconds = max(1, int(dist / 1.5))
-                            current_time += timedelta(seconds=seconds)
-                        
+                    # Calculate exactly T0 + i * 5 seconds (Modified to 5s)
+                    new_timestamp = current_time + timedelta(seconds=i * 5)
+                    new_time_str = new_timestamp.isoformat() + "Z"
+                    
+                    if time_tag is None:
+                        # Create new tag
                         missing_tags += 1
                         points_fixed += 1
                         new_time = ET.Element('time')
-                        new_time.text = current_time.isoformat() + "Z"
+                        new_time.text = new_time_str
                         trkpt.append(new_time)
+                    else:
+                        # Overwrite existing tag
+                        if time_tag.text != new_time_str:
+                            # Only count as fix if we actually changed it
+                            points_fixed += 1
+                        time_tag.text = new_time_str
 
-                    last_lat = lat
-                    last_lon = lon
-
+                # Save Fixed File
                 if points_fixed > 0:
                     tree.write(fixed_path, encoding='UTF-8', xml_declaration=True)
-                    status = f"FIXED ({points_fixed} tags added)"
+                    status = f"FIXED ({points_fixed} tags added/updated)"
                     fixed_count += 1
                 else:
                     status = "OK"
