@@ -24,6 +24,7 @@ REQUIRED_PROVINCES = {
 }
 
 # Mode 3: RSBSA Report Columns
+# Added 'crop_area' to this list
 TARGET_COLS_RSBSA = [
     'farmer_address_mun', 
     'farmer_address_bgy', 
@@ -32,7 +33,8 @@ TARGET_COLS_RSBSA = [
     'fisherfolk', 
     'gender', 
     'agency',
-    'birthday'
+    'birthday',
+    'crop_area'
 ]
 
 # Mode 4: Geotag Cleaning Columns (Strict)
@@ -72,6 +74,7 @@ def clear_screen():
 def print_header():
     print("="*70)
     print("   🌾  RSBSA TOOLBELT (Region 6)")
+    print("   Powered by XlsxWriter")
     print("="*70)
 
 class LoadingSpinner:
@@ -255,6 +258,7 @@ def process_rsbsa_report(file_path, output_dir):
                     col_gender = 'gender'
                     col_agency = 'agency'
                     col_birthday = 'birthday'
+                    col_area = 'crop_area'
 
                     # Counts
                     df['is_farmer'] = df[col_farmer].astype(str).str.upper().map({'YES': 1}).fillna(0)
@@ -273,6 +277,16 @@ def process_rsbsa_report(file_path, output_dir):
                     df['is_working_age'] = ((df['age_years'] > 30) & (df['age_years'] < 60)).astype(int)
                     df['is_senior'] = (df['age_years'] >= 60).astype(int)
 
+                    # Crop Area Analytics
+                    if col_area in df.columns:
+                        df[col_area] = pd.to_numeric(df[col_area], errors='coerce').fillna(0)
+                    else:
+                        df[col_area] = 0.0
+                    
+                    # Rows with area >= 2
+                    df['is_large_area'] = (df[col_area] >= 2).astype(int)
+
+                    # Aggregation
                     summary = df.groupby([col_mun, col_bgy]).agg({
                         'is_farmer': 'sum',
                         'is_farmworker': 'sum',
@@ -282,14 +296,17 @@ def process_rsbsa_report(file_path, output_dir):
                         'female_count': 'sum',
                         'is_youth': 'sum',
                         'is_working_age': 'sum',
-                        'is_senior': 'sum'
+                        'is_senior': 'sum',
+                        col_area: 'sum',       # Sum of Declared Area
+                        'is_large_area': 'sum' # Count of >= 2
                     }).reset_index()
 
                     summary.columns = [
                         'Municipality', 'Barangay', 
                         'Farmers', 'Farmworkers', 'Fisherfolk', 
                         'Distinct Agencies', 'Male', 'Female',
-                        'Youth (12-30)', 'Working Age (31-59)', 'Senior (60+)'
+                        'Youth (12-30)', 'Working Age (31-59)', 'Senior (60+)',
+                        'Total Declared Area (Ha)', 'Farmers with >= 2 Ha'
                     ]
 
                     summary = summary.sort_values(['Municipality', 'Barangay'])
@@ -302,6 +319,7 @@ def process_rsbsa_report(file_path, output_dir):
                     header_format = workbook.add_format({'bold': True, 'font_size': 14})
                     date_format = workbook.add_format({'italic': True})
                     legend_format = workbook.add_format({'italic': True, 'font_color': 'gray', 'font_size': 10})
+                    num_fmt = workbook.add_format({'num_format': '#,##0.00'})
                     
                     worksheet.write('A1', f"RSBSA Summary Report - {province}", header_format)
                     worksheet.write('A2', f"As of: {as_of_str}", date_format)
@@ -310,6 +328,8 @@ def process_rsbsa_report(file_path, output_dir):
                     worksheet.set_column(0, 0, 20)
                     worksheet.set_column(1, 1, 25)
                     worksheet.set_column(2, 10, 15)
+                    worksheet.set_column(11, 11, 22, num_fmt) # Format Area Column
+                    worksheet.set_column(12, 12, 20)          # Format >=2 Column
 
         print(f"\n🎉 Report Generated: {output_filename}")
         print(f"   Location: {output_path}")
@@ -338,8 +358,8 @@ def load_parcel_reference(parcel_path):
         # Determine Province Column in Parcel List
         col_prov = next((c for c in cols if c.upper() in ['PROVINCE', 'FARMER ADDRESS 3']), None)
         
-        # Attempt to find Last Name column for sorting (No longer needed for Mode 4 output sort)
-        # col_lname = next((c for c in cols if c.upper() == 'LAST NAME'), None)
+        # Attempt to find Last Name column for sorting
+        col_lname = next((c for c in cols if c.upper() == 'LAST NAME'), None)
 
         if not all([col_id, col_area, col_comm]):
             return None, None
@@ -544,7 +564,7 @@ def run_mode_4_workflow(input_dir, output_dir):
     
     print("\n🎉 Batch Processing Complete!")
 
-# --- MODE 5: CROSS-FILE AUDIT ---
+# --- MODE 5: CROSS-FILE AUDIT (Renamed from 6) ---
 
 def process_cross_file_audit(input_dir, output_dir):
     """
@@ -671,7 +691,7 @@ def process_cross_file_audit(input_dir, output_dir):
     except Exception as e:
         print(f"❌ Save Error: {e}")
 
-# --- MODE 6: GPX FIXER ---
+# --- MODE 6: GPX FIXER (Renamed from 5) ---
 
 def process_gpx_fixer(input_dir, output_dir):
     """Scans .gpx files, validates, fixes missing tags, and exports Summary."""
@@ -750,7 +770,7 @@ def process_gpx_fixer(input_dir, output_dir):
                             break # Found anchor
                         except: pass
                 
-                # 2. Sequential Rewrite Loop (1Hz)
+                # 2. Sequential Rewrite Loop (5s Interval)
                 for i, trkpt in enumerate(all_trkpts):
                     # Get Geometry
                     try:
@@ -779,14 +799,14 @@ def process_gpx_fixer(input_dir, output_dir):
                         trkpt.append(new_ele)
                         ele = new_ele # Ref for ordering
 
-                    # HANDLE TIME (Strict 1Hz Sequential)
+                    # HANDLE TIME (Strict 5s Sequential)
                     time_tag = None
                     for child in trkpt:
                         if child.tag.endswith('time'):
                             time_tag = child
                             break
                     
-                    # Calculate exactly T0 + i * 5 seconds (Modified to 5s)
+                    # Calculate exactly T0 + (i * 5) seconds
                     new_timestamp = current_time + timedelta(seconds=i * 5)
                     new_time_str = new_timestamp.isoformat() + "Z"
                     
