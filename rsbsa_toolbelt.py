@@ -338,8 +338,8 @@ def load_parcel_reference(parcel_path):
         # Determine Province Column in Parcel List
         col_prov = next((c for c in cols if c.upper() in ['PROVINCE', 'FARMER ADDRESS 3']), None)
         
-        # Attempt to find Last Name column for sorting
-        col_lname = next((c for c in cols if c.upper() == 'LAST NAME'), None)
+        # Attempt to find Last Name column for sorting (No longer needed for Mode 4 output sort)
+        # col_lname = next((c for c in cols if c.upper() == 'LAST NAME'), None)
 
         if not all([col_id, col_area, col_comm]):
             return None, None
@@ -410,7 +410,6 @@ def process_single_geotag_logic(geotag_path, df_parcel, master_province, output_
                 df_duplicates.to_excel(writer, index=False)
 
         # MERGE
-        # We do NOT need LAST_NAME here anymore as requested
         merge_cols = ['KEY_ID', 'CROP AREA', 'COMMODITY']
 
         df_merged = pd.merge(
@@ -778,6 +777,7 @@ def process_gpx_fixer(input_dir, output_dir):
                         new_ele = ET.Element('ele')
                         new_ele.text = f"{current_ele:.2f}"
                         trkpt.append(new_ele)
+                        ele = new_ele # Ref for ordering
 
                     # HANDLE TIME (Strict 1Hz Sequential)
                     time_tag = None
@@ -797,12 +797,26 @@ def process_gpx_fixer(input_dir, output_dir):
                         new_time = ET.Element('time')
                         new_time.text = new_time_str
                         trkpt.append(new_time)
+                        time_tag = new_time # Ref for ordering
                     else:
                         # Overwrite existing tag
                         if time_tag.text != new_time_str:
-                            # Only count as fix if we actually changed it
                             points_fixed += 1
                         time_tag.text = new_time_str
+
+                    # --- XML ORDERING FIX ---
+                    # Ensure <ele> is before <time>
+                    if ele is not None and time_tag is not None:
+                        # Remove if currently attached
+                        try: trkpt.remove(ele)
+                        except: pass
+                        try: trkpt.remove(time_tag)
+                        except: pass
+                        
+                        # Insert at top in reverse order of desired appearance
+                        # Desired: <ele>, <time>
+                        trkpt.insert(0, time_tag) # Becomes index 0
+                        trkpt.insert(0, ele)      # Becomes index 0, pushes time to 1
 
                 # Save Fixed File
                 if points_fixed > 0:
