@@ -36,7 +36,7 @@ TARGET_COLS_RSBSA = [
     'crop_area'
 ]
 
-# Mode 5: Geotag Cleaning Columns (Strict)
+# Mode 5: Geotag Cleaning Columns
 TARGET_COLS_GEOTAG = [
     'GEOREF ID',
     'RSBSA ID',
@@ -206,9 +206,10 @@ def calculate_polygon_area(lats, lons):
 def process_masterlist_merger(master_path, parcel_path, output_dir):
     """
     Merges Masterlist with Parcel List.
-    1. Checks Anomalies (Identity, ID Duplicates)
-    2. Merges but KEEPS all parcel rows (1:Many relationship).
-    3. Adds 'HAS_MULTIPLE_LANDHOLDINGS' flag.
+    1. Checks Anomalies
+    2. LEFT MERGE: Keeps ALL Masterlist Farmers.
+       - Expands rows if they have multiple parcels.
+    3. Sorts by Municipality -> Barangay -> Last Name
     """
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
@@ -248,7 +249,8 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
             
             # Identify Keys
             col_ffrs = next((c for c in df_p.columns if 'ffrs' in c or 'system generated' in c), None)
-            # We don't strictly need area/comm/address for the merge key, but we keep them
+            col_area = next((c for c in df_p.columns if 'parcel area' in c or 'crop area' in c), None)
+            col_comm = next((c for c in df_p.columns if 'commodity' in c), None)
             
             if not col_ffrs:
                 print("❌ Error: FFRS ID column not found in Parcel List.")
@@ -259,11 +261,15 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
         # 3. ANALYZE ANOMALIES
         with LoadingSpinner("Detecting Anomalies..."):
             
-            # A. Identity Conflicts (Same Name+Mid+Last+Bday, Diff ID)
+            # Identify Name columns dynamically
             m_fname = next((c for c in df_m.columns if 'first' in c and 'name' in c), 'first_name')
             m_mname = next((c for c in df_m.columns if 'middle' in c and 'name' in c), 'middle_name')
             m_lname = next((c for c in df_m.columns if 'last' in c and 'name' in c), 'last_name')
             m_bday = next((c for c in df_m.columns if 'birth' in c), 'birthday')
+            
+            # Identify Address columns for sorting
+            m_mun = next((c for c in df_m.columns if 'mun' in c and 'address' in c), 'farmer_address_mun')
+            m_bgy = next((c for c in df_m.columns if 'bgy' in c and 'address' in c), 'farmer_address_bgy')
 
             # Create Signature
             df_m['IDENTITY_SIG'] = (
@@ -276,83 +282,112 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
             dup_sig_mask = df_m.duplicated(subset=['IDENTITY_SIG'], keep=False)
             df_identity_conflicts = df_m[dup_sig_mask].sort_values('IDENTITY_SIG')
             
-            # Filter for different IDs
             if not df_identity_conflicts.empty:
                 sig_counts = df_identity_conflicts.groupby('IDENTITY_SIG')['KEY_ID'].nunique()
                 suspicious_sigs = sig_counts[sig_counts > 1].index
                 df_identity_conflicts = df_identity_conflicts[df_identity_conflicts['IDENTITY_SIG'].isin(suspicious_sigs)]
 
-            # B. ID Conflicts
             dup_id_mask = df_m.duplicated(subset=['KEY_ID'], keep=False)
             df_id_duplicates = df_m[dup_id_mask].sort_values('KEY_ID')
 
-            # C. Identify Multiple Landholdings
-            # Count parcels per ID in the Parcel List
-            parcel_counts = df_p['KEY_ID'].value_counts()
-            
-            # Map this count back to the Parcel Dataframe
-            df_p['PARCEL_COUNT'] = df_p['KEY_ID'].map(parcel_counts)
-            df_p['HAS_MULTIPLE_LANDHOLDINGS'] = df_p['PARCEL_COUNT'] > 1
+            # Dedupe parcel list exact rows
+            len_before = len(df_p)
+            df_p_deduped = df_p.drop_duplicates() 
+            duplicates_removed_count = len_before - len(df_p_deduped)
 
-        # 4. MERGE (FULL JOIN STRATEGY)
-        with LoadingSpinner("Merging Datasets (Expanding Rows)..."):
-            # We perform a RIGHT JOIN (or Outer) to keep all parcel rows.
-            # Masterlist data will be duplicated for every parcel row.
-            
-            # Drop duplicate columns in Parcel List that might exist in Masterlist to avoid collision
-            # (Except Key ID and new flags)
-            cols_to_use = list(df_p.columns)
-            # Optionally remove redundant name columns if they exist in Parcel list to keep output clean?
-            # For now, we keep everything from Parcel list as requested to see address/commodity differences.
-            
-            df_final = pd.merge(df_m, df_p, on='KEY_ID', how='right')
-            
-            # Fill Multi-Landholding flag for those who matched
-            df_final['HAS_MULTIPLE_LANDHOLDINGS'] = df_final['HAS_MULTIPLE_LANDHOLDINGS'].fillna(False)
+        # 4. PREPARE PARCEL DATA FOR MERGE
+        with LoadingSpinner("Preparing Merge Data..."):
+            # Count Parcels per ID to identify Multi-Holdings later
+            parcel_counts = df_p_deduped['KEY_ID'].value_counts().to_dict()
 
-            # Cleanup
+            # Select ONLY Parcel-Specific Columns to merge (Avoid duplication of Name/Bday/etc.)
+            # We keep: KEY_ID, PARCEL ADDRESS, AREA, COMMODITY, FARM TYPE, etc.
+            # We drop: Demographics columns that exist in Masterlist
+            
+            drop_cols_if_exist = [
+                'last name', 'first name', 'middle name', 'ext name', 'gender', 
+                'birthdate', 'farmer', 'farmworker', 'fisherfolk', 'agriyouth', 
+                'if ip', 'tribe', 'organic practitioners', 'arb', 
+                'farmer address 1', 'farmer address 2', 'farmer address 3'
+            ]
+            # Normalize to match current df_p lower case
+            drop_cols_lower = [c.lower() for c in drop_cols_if_exist]
+            
+            cols_to_keep = [c for c in df_p_deduped.columns if c not in drop_cols_lower or c == 'KEY_ID']
+            
+            df_p_clean = df_p_deduped[cols_to_keep].copy()
+
+            # LEFT MERGE: Keep Masterlist (Left), bring in Parcel rows (Right)
+            # This expands 1 Farmer -> N Rows if they have parcels
+            df_final = pd.merge(df_m, df_p_clean, on='KEY_ID', how='left')
+            
+            # Add Analysis Columns
+            df_final['PARCEL_COUNT'] = df_final['KEY_ID'].map(parcel_counts).fillna(0).astype(int)
+            df_final['HAS_MULTIPLE_LANDHOLDINGS'] = df_final['PARCEL_COUNT'] > 1
+            
+            # Drop helpers
             df_final.drop(columns=['KEY_ID', 'IDENTITY_SIG'], inplace=True)
 
-        # 5. SAVE
+        # 5. SORT AND REORDER
+        with LoadingSpinner("Sorting & Reordering..."):
+            # Sort: Mun -> Bgy -> Last Name
+            sort_keys = []
+            if m_mun in df_final.columns: sort_keys.append(m_mun)
+            if m_bgy in df_final.columns: sort_keys.append(m_bgy)
+            if m_lname in df_final.columns: sort_keys.append(m_lname)
+            
+            if sort_keys:
+                df_final.sort_values(by=sort_keys, inplace=True)
+
+            # Reorder: Move Last Name before First Name
+            cols = list(df_final.columns)
+            if m_lname in cols and m_fname in cols:
+                cols.remove(m_lname)
+                fname_idx = cols.index(m_fname)
+                cols.insert(fname_idx, m_lname)
+                df_final = df_final[cols]
+
+        # 6. SAVE
         with LoadingSpinner(f"Saving Report to {output_filename}..."):
             with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
-                # Sheet 1: Merged Data
+                # Sheet 1: Full Data
                 df_final.to_excel(writer, sheet_name='Merged Data', index=False)
                 
-                # Sheet 2
+                # Sheet 2: Analysis
                 if not df_identity_conflicts.empty:
                     cols = [c for c in df_identity_conflicts.columns if c != 'IDENTITY_SIG']
                     df_identity_conflicts[cols].to_excel(writer, sheet_name='Identity Conflicts', index=False)
                 
-                # Sheet 3
                 if not df_id_duplicates.empty:
                     cols = [c for c in df_id_duplicates.columns if c != 'IDENTITY_SIG']
                     df_id_duplicates[cols].to_excel(writer, sheet_name='Duplicate IDs', index=False)
 
-                # Sheet 4: Stats
-                unique_farmers_in_merged = df_final[col_rsbsa].nunique()
+                # Sheet 3: Stats
                 stats = pd.DataFrame({
                     'Metric': [
-                        'Total Rows in Output',
-                        'Unique Farmers (Based on RSBSA ID)',
-                        'Rows with Multiple Landholdings',
-                        'Potential Identity Theft Cases'
+                        'Total Rows in Output', 
+                        'Unique Farmers (from Masterlist)', 
+                        'Farmers with Parcels',
+                        'Farmers with Multiple Landholdings',
+                        'Farmers with NO Parcels (Included)'
                     ],
                     'Value': [
                         len(df_final), 
-                        unique_farmers_in_merged,
-                        len(df_final[df_final['HAS_MULTIPLE_LANDHOLDINGS'] == True]),
-                        len(df_identity_conflicts)
+                        len(df_m), 
+                        len(df_final[df_final['PARCEL_COUNT'] > 0]['rsbsa_no'].unique()) if 'rsbsa_no' in df_final else 0,
+                        len(df_final[df_final['HAS_MULTIPLE_LANDHOLDINGS'] == True]['rsbsa_no'].unique()) if 'rsbsa_no' in df_final else 0,
+                        len(df_final[df_final['PARCEL_COUNT'] == 0])
                     ]
                 })
                 stats.to_excel(writer, sheet_name='Statistics', index=False)
                 
                 wb = writer.book
                 ws = writer.sheets['Statistics']
-                ws.set_column(0, 0, 40)
+                ws.set_column(0, 0, 45)
 
         print(f"\n🎉 Processing Complete!")
         print(f"   Output: {output_filename}")
+        print(f"   Total Output Rows: {len(df_final)}")
 
     except Exception as e:
         print(f"❌ Critical Error: {e}")
@@ -389,6 +424,12 @@ def run_stack_rows(input_dir, output_dir):
     
     if merged_data:
         final_df = pd.concat(merged_data, ignore_index=True)
+        
+        # Sort Final Stacked Data as well if column exists
+        sort_col_final = next((c for c in final_df.columns if 'last' in c.lower() and 'name' in c.lower()), None)
+        if sort_col_final:
+            final_df.sort_values(by=sort_col_final, inplace=True)
+
         path = os.path.join(output_dir, output_filename)
         with pd.ExcelWriter(path, engine='xlsxwriter') as writer:
             final_df.to_excel(writer, index=False)
