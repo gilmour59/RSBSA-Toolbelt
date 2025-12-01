@@ -210,50 +210,45 @@ def calculate_polygon_area(lats, lons):
 
 def process_masterlist_merger(master_path, parcel_path, output_dir):
     """
-    Merges Masterlist with Parcel List.
-    1. Checks Anomalies (Fuzzy Identity, ID Duplicates)
-    2. Aggregates Parcel Data
-    3. Sorts by Municipality -> Barangay -> Last Name
-    4. Reorders columns to Last Name, First Name
-    5. Reports Unmatched Farmers
+    MODE 2: TRIAGE SYSTEM
+    Separates data into 3 distinct sheets:
+    1. CLEAN - WITH PARCELS (Ready for processing)
+    2. CLEAN - NO PARCELS (For follow-up)
+    3. ERRONEOUS / CONFLICTS (Duplicates, Identity Issues - Quarantine)
     """
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    output_filename = f"Masterlist_Merged_Analysis_{timestamp}.xlsx"
+    # NEW NAMING CONVENTION: {MasterlistName}-merged.xlsx
+    base_name = os.path.splitext(os.path.basename(master_path))[0]
+    output_filename = f"{base_name}-merged.xlsx"
     output_path = os.path.join(output_dir, output_filename)
 
-    print("\n--- Analyzing & Merging Datasets ---")
+    print(f"\n--- Starting Triage Analysis for: {base_name} ---")
     
     try:
-        # 1. LOAD MASTERLIST
-        with LoadingSpinner("Loading Masterlist (Farmer Listing)..."):
-            if master_path.lower().endswith('.csv'):
-                df_m = pd.read_csv(master_path)
-            else:
-                df_m = pd.read_excel(master_path)
+        # --- 1. LOAD MASTERLIST ---
+        with LoadingSpinner("Loading Masterlist..."):
+            if master_path.lower().endswith('.csv'): df_m = pd.read_csv(master_path)
+            else: df_m = pd.read_excel(master_path)
             
-            # Normalize Columns
             df_m.columns = [c.strip().lower() for c in df_m.columns]
             
-            # Identify RSBSA Column
+            # Find RSBSA ID
             col_rsbsa = next((c for c in df_m.columns if 'rsbsa' in c and 'no' in c), None)
             if not col_rsbsa:
-                print("❌ Error: RSBSA No. column not found in Masterlist.")
+                print("❌ Error: RSBSA No. column not found.")
                 return
             
-            # Standardize ID for matching
             df_m['KEY_ID'] = df_m[col_rsbsa].astype(str).str.strip().str.upper()
+            df_m['DATA_STATUS'] = 'CLEAN' 
+            df_m['ERROR_TAG'] = ''        
 
-        # 2. LOAD PARCEL LIST
+        # --- 2. LOAD PARCEL LIST ---
         with LoadingSpinner("Loading Parcel List..."):
-            if parcel_path.lower().endswith('.csv'):
-                df_p = pd.read_csv(parcel_path)
-            else:
-                df_p = pd.read_excel(parcel_path)
+            if parcel_path.lower().endswith('.csv'): df_p = pd.read_csv(parcel_path)
+            else: df_p = pd.read_excel(parcel_path)
             
             df_p.columns = [c.strip().lower() for c in df_p.columns]
             
-            # Identify Keys
             col_ffrs = next((c for c in df_p.columns if 'ffrs' in c or 'system generated' in c), None)
             col_area = next((c for c in df_p.columns if 'parcel area' in c or 'crop area' in c), None)
             col_comm = next((c for c in df_p.columns if 'commodity' in c), None)
@@ -263,202 +258,98 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
                 return
             
             df_p['KEY_ID'] = df_p[col_ffrs].astype(str).str.strip().str.upper()
+            if col_area: df_p[col_area] = pd.to_numeric(df_p[col_area], errors='coerce').fillna(0)
+            df_p['NORM_COMM'] = df_p[col_comm].apply(normalize_commodity)
 
-        # 3. ANALYZE ANOMALIES
-        with LoadingSpinner("Detecting Anomalies & Duplicates (Fuzzy)..."):
+        # --- 3. FLAGGING ERRORS (TRIAGE) ---
+        with LoadingSpinner("Triaging: Detecting Duplicates & Conflicts..."):
             
-            # Identify Name columns dynamically
+            # A. STRICT DUPLICATE IDs
+            dup_mask = df_m.duplicated(subset=['KEY_ID'], keep=False)
+            df_m.loc[dup_mask, 'DATA_STATUS'] = 'ERROR'
+            df_m.loc[dup_mask, 'ERROR_TAG'] += '[Duplicate RSBSA ID] '
+
+            # B. FUZZY IDENTITY CONFLICTS
             m_fname = next((c for c in df_m.columns if 'first' in c and 'name' in c), 'first_name')
-            m_mname = next((c for c in df_m.columns if 'middle' in c and 'name' in c), 'middle_name')
             m_lname = next((c for c in df_m.columns if 'last' in c and 'name' in c), 'last_name')
             m_bday = next((c for c in df_m.columns if 'birth' in c), 'birthday')
-            
-            # Identify Address columns for sorting
-            m_mun = next((c for c in df_m.columns if 'mun' in c and 'address' in c), 'farmer_address_mun')
-            m_bgy = next((c for c in df_m.columns if 'bgy' in c and 'address' in c), 'farmer_address_bgy')
 
-            # --- FUZZY DUPLICATE DETECTION ---
-            # Create "Loose Signature" (Last Name + Birthday) to group potential matches
             df_m['LOOSE_SIG'] = (
                 df_m[m_lname].fillna('').astype(str).str.strip().str.upper() + 
                 df_m[m_bday].astype(str)
             )
             
-            # Filter groups where LOOSE_SIG has duplicate entries
-            potential_dupes = df_m[df_m.duplicated(subset=['LOOSE_SIG'], keep=False)].copy()
+            potential_dupes = df_m[df_m.duplicated(subset=['LOOSE_SIG'], keep=False)]
+            conflict_ids = set()
             
-            fuzzy_matches = []
             if not potential_dupes.empty:
-                # Group by LOOSE_SIG and check First/Middle names
                 for sig, group in potential_dupes.groupby('LOOSE_SIG'):
                     if len(group) < 2: continue
-                    
-                    # Compare every pair in this group
                     rows = group.to_dict('records')
                     for i in range(len(rows)):
                         for j in range(i + 1, len(rows)):
-                            r1 = rows[i]
-                            r2 = rows[j]
-                            
-                            # Skip if IDs are identical (that's a different error type)
-                            if r1['KEY_ID'] == r2['KEY_ID']: continue
-                            
-                            # Build full strings for fuzzy compare
-                            name1 = f"{r1.get(m_fname,'')} {r1.get(m_mname,'')}".strip().upper()
-                            name2 = f"{r2.get(m_fname,'')} {r2.get(m_mname,'')}".strip().upper()
-                            
-                            # Check similarity (Threshold 0.85 allows for 'MARIA' vs 'MA.')
-                            ratio = similar(name1, name2)
-                            if ratio > 0.85:
-                                r1_copy = r1.copy()
-                                r2_copy = r2.copy()
-                                
-                                # Construct Reason
-                                reason = "Same Name + Birthday"
-                                # Check Municipality
-                                if str(r1.get(m_mun,'')).strip().upper() == str(r2.get(m_mun,'')).strip().upper():
-                                    reason += " + Same Municipality"
-                                # Check Exact Name
-                                if name1 == name2:
-                                    reason += " + Exact Name Match"
-                                else:
-                                    reason += f" + Fuzzy Name Match ({int(ratio*100)}%)"
-                                
-                                r1_copy['REASON'] = reason
-                                r2_copy['REASON'] = reason
-                                
-                                fuzzy_matches.append(r1_copy)
-                                fuzzy_matches.append(r2_copy)
-            
-            if fuzzy_matches:
-                df_identity_conflicts = pd.DataFrame(fuzzy_matches).drop_duplicates(subset=['KEY_ID'])
-            else:
-                df_identity_conflicts = pd.DataFrame()
+                            r1, r2 = rows[i], rows[j]
+                            if r1['KEY_ID'] == r2['KEY_ID']: continue 
+                            name1 = f"{r1.get(m_fname,'')} {r1.get(m_lname,'')}".strip().upper()
+                            name2 = f"{r2.get(m_fname,'')} {r2.get(m_lname,'')}".strip().upper()
+                            if similar(name1, name2) > 0.85:
+                                conflict_ids.add(r1['KEY_ID'])
+                                conflict_ids.add(r2['KEY_ID'])
 
-            # B. ID Conflicts (Strict ID Duplicates)
-            dup_id_mask = df_m.duplicated(subset=['KEY_ID'], keep=False)
-            df_id_duplicates = df_m[dup_id_mask].sort_values('KEY_ID')
+            if conflict_ids:
+                is_conflict = df_m['KEY_ID'].isin(conflict_ids)
+                df_m.loc[is_conflict, 'DATA_STATUS'] = 'ERROR'
+                df_m.loc[is_conflict, 'ERROR_TAG'] += '[Identity Conflict] '
 
-            # C. Parcel Deduplication
-            len_before = len(df_p)
-            # FIX: Use .copy() to avoid SettingWithCopyWarning later
-            df_p_deduped = df_p.drop_duplicates().copy() 
-            duplicates_removed_count = len_before - len(df_p_deduped)
-
-        # 4. AGGREGATE PARCELS
-        with LoadingSpinner("Aggregating Parcel Data..."):
-            if col_area:
-                df_p_deduped[col_area] = pd.to_numeric(df_p_deduped[col_area], errors='coerce').fillna(0)
-
-            df_p_deduped['NORM_COMM'] = df_p_deduped[col_comm].apply(normalize_commodity)
-
-            parcel_summary = df_p_deduped.groupby('KEY_ID').agg({
+        # --- 4. MERGE PARCELS ---
+        with LoadingSpinner("Linking Parcels to Farmers..."):
+            parcel_summary = df_p.groupby('KEY_ID').agg({
                 col_comm: lambda x: ', '.join(sorted(list(set(x.dropna().astype(str))))),
                 col_area: 'sum',
                 'KEY_ID': 'count'
-            }).rename(columns={
-                col_comm: 'PARCEL_COMMODITIES',
-                col_area: 'TOTAL_PARCEL_AREA_HA',
-                'KEY_ID': 'PARCEL_COUNT'
-            })
+            }).rename(columns={col_comm: 'PARCEL_COMMODITIES', col_area: 'TOTAL_PARCEL_AREA_HA', 'KEY_ID': 'PARCEL_COUNT'})
             
-            # Pivot-like Areas
-            rice_area = df_p_deduped[df_p_deduped['NORM_COMM'] == 'RICE'].groupby('KEY_ID')[col_area].sum()
-            parcel_summary['AREA_RICE_HA'] = rice_area
-            
-            corn_area = df_p_deduped[df_p_deduped['NORM_COMM'] == 'CORN'].groupby('KEY_ID')[col_area].sum()
-            parcel_summary['AREA_CORN_HA'] = corn_area
-            
-            sugar_area = df_p_deduped[df_p_deduped['NORM_COMM'] == 'SUGAR'].groupby('KEY_ID')[col_area].sum()
-            parcel_summary['AREA_SUGAR_HA'] = sugar_area
+            for crop in ['RICE', 'CORN', 'SUGAR']:
+                crop_area = df_p[df_p['NORM_COMM'] == crop].groupby('KEY_ID')[col_area].sum()
+                parcel_summary[f'AREA_{crop}_HA'] = crop_area
 
-            cols_to_fill = ['AREA_RICE_HA', 'AREA_CORN_HA', 'AREA_SUGAR_HA']
-            parcel_summary[cols_to_fill] = parcel_summary[cols_to_fill].fillna(0)
-
-            # Merge LEFT to keep all Masterlist farmers
+            parcel_summary.fillna(0, inplace=True)
             df_final = pd.merge(df_m, parcel_summary, on='KEY_ID', how='left')
             
-            # Fill Missing Data
-            df_final['PARCEL_COUNT'] = df_final['PARCEL_COUNT'].fillna(0).astype(int)
-            df_final['TOTAL_PARCEL_AREA_HA'] = df_final['TOTAL_PARCEL_AREA_HA'].fillna(0)
+            cols_to_fill = ['PARCEL_COUNT', 'TOTAL_PARCEL_AREA_HA', 'AREA_RICE_HA', 'AREA_CORN_HA', 'AREA_SUGAR_HA']
+            df_final[cols_to_fill] = df_final[cols_to_fill].fillna(0)
             df_final['PARCEL_COMMODITIES'] = df_final['PARCEL_COMMODITIES'].fillna('None')
-            df_final['HAS_MULTIPLE_LANDHOLDINGS'] = df_final['PARCEL_COUNT'] > 1
-            
-            # Capture Unmatched
-            df_unmatched = df_final[df_final['PARCEL_COUNT'] == 0].copy()
-            
-            # Drop helpers
-            df_final.drop(columns=['KEY_ID', 'LOOSE_SIG'], inplace=True, errors='ignore')
 
-        # 5. SORT AND REORDER
-        with LoadingSpinner("Sorting & Reordering..."):
-            sort_keys = []
-            if m_mun in df_final.columns: sort_keys.append(m_mun)
-            if m_bgy in df_final.columns: sort_keys.append(m_bgy)
-            if m_lname in df_final.columns: sort_keys.append(m_lname)
+        # --- 5. SPLIT & SAVE ---
+        with LoadingSpinner("Splitting and Saving..."):
+            base_cols = list(df_m.columns)
+            cols_clean = [c for c in base_cols if c not in ['LOOSE_SIG', 'DATA_STATUS', 'ERROR_TAG', 'KEY_ID']]
+            cols_parcel = ['PARCEL_COUNT', 'TOTAL_PARCEL_AREA_HA', 'PARCEL_COMMODITIES', 'AREA_RICE_HA', 'AREA_CORN_HA', 'AREA_SUGAR_HA']
+            final_col_order = cols_clean + cols_parcel
             
-            if sort_keys:
-                df_final.sort_values(by=sort_keys, inplace=True)
+            df_errors = df_final[df_final['DATA_STATUS'] == 'ERROR'].copy()
+            df_clean = df_final[df_final['DATA_STATUS'] == 'CLEAN'].copy()
+            
+            df_with = df_clean[df_clean['PARCEL_COUNT'] > 0].copy()
+            df_no = df_clean[df_clean['PARCEL_COUNT'] == 0].copy()
 
-            cols = list(df_final.columns)
-            if m_lname in cols and m_fname in cols:
-                cols.remove(m_lname)
-                fname_idx = cols.index(m_fname)
-                cols.insert(fname_idx, m_lname)
-                df_final = df_final[cols]
-
-        # 6. SAVE
-        with LoadingSpinner(f"Saving Report to {output_filename}..."):
             with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
-                df_final.to_excel(writer, sheet_name='Masterlist with Parcels', index=False)
+                df_with[final_col_order].to_excel(writer, sheet_name='Clean - With Parcels', index=False)
+                df_no[final_col_order].to_excel(writer, sheet_name='Clean - No Parcels', index=False)
+                err_cols = ['ERROR_TAG', 'KEY_ID'] + final_col_order
+                err_cols = [c for c in err_cols if c in df_errors.columns]
+                df_errors[err_cols].to_excel(writer, sheet_name='Erroneous & Conflicts', index=False)
                 
-                if not df_unmatched.empty:
-                    df_unmatched.to_excel(writer, sheet_name='Farmers No Parcel', index=False)
-
-                if not df_identity_conflicts.empty:
-                    # Rearrange columns to show REASON first if possible or near name
-                    cols = [c for c in df_identity_conflicts.columns if c not in ['LOOSE_SIG', 'KEY_ID']]
-                    # Ensure REASON is included
-                    if 'REASON' in df_identity_conflicts.columns:
-                         # Put REASON at the start or end? Let's put it at the end for context
-                         pass
-                    df_identity_conflicts[cols].to_excel(writer, sheet_name='Identity Conflicts (Fuzzy)', index=False)
-                
-                if not df_id_duplicates.empty:
-                    cols = [c for c in df_id_duplicates.columns if c not in ['LOOSE_SIG', 'KEY_ID']]
-                    df_id_duplicates[cols].to_excel(writer, sheet_name='Duplicate IDs', index=False)
-
-                stats = pd.DataFrame({
-                    'Metric': [
-                        'Total Farmers', 
-                        'Farmers with Parcels', 
-                        'Farmers without Parcels (Missing in Parcel List)',
-                        'Total Parcels Linked',
-                        'Farmers with Multiple Landholdings', 
-                        'Potential Identity Theft Cases (Fuzzy Match)'
-                    ],
-                    'Value': [
-                        len(df_final), 
-                        len(df_final[df_final['PARCEL_COUNT'] > 0]),
-                        len(df_unmatched),
-                        df_final['PARCEL_COUNT'].sum(),
-                        len(df_final[df_final['HAS_MULTIPLE_LANDHOLDINGS'] == True]),
-                        len(df_identity_conflicts)
-                    ]
-                })
-                stats.to_excel(writer, sheet_name='Statistics', index=False)
-                
+                # Red highlight for errors
                 wb = writer.book
-                ws = writer.sheets['Statistics']
-                ws.set_column(0, 0, 50)
+                ws_err = writer.sheets['Erroneous & Conflicts']
+                red_fmt = wb.add_format({'font_color': '#9C0006', 'bg_color': '#FFC7CE'})
+                ws_err.conditional_format(1, 0, len(df_errors), 0, {'type': 'no_blanks', 'format': red_fmt})
 
-        print(f"\n🎉 Processing Complete!")
-        print(f"   Output: {output_filename}")
-        print(f"   Farmers without parcels: {len(df_unmatched)}")
-        print(f"   Identity Conflicts: {len(df_identity_conflicts)}")
+        print(f"🎉 Processed: {output_filename}")
 
     except Exception as e:
-        print(f"❌ Critical Error: {e}")
+        print(f"❌ Error: {e}")
 
 # --- MODE 1: STACK ROWS ---
 
@@ -505,33 +396,135 @@ def run_stack_rows(input_dir, output_dir):
 
 # --- MODE 3: COMBINE SHEETS (Renamed from 2) ---
 
-def run_combine_sheets(input_dir, output_dir):
-    try:
-        all_files = [f for f in os.listdir(input_dir) if f.lower().endswith(('.xlsx', '.csv')) and not f.startswith('~$')]
-    except: return
-    if not all_files:
-        print("❌ No files found.")
-        return
-    print("\n--- Starting Sheet Combine ---")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    output_filename = get_output_filename(f"Sheets_Output_{timestamp}.xlsx")
-    path = os.path.join(output_dir, output_filename)
+def run_regional_consolidation(input_dir, output_dir):
+    """
+    MODE 3: REGIONAL CONSOLIDATOR
+    1. Scans input folder for Mode 2 outputs.
+    2. VALIDATION: Ensures exactly one file exists for each of the 6 Region 6 provinces.
+    3. PROCESSING: Combines them into 3 Master Files (With Parcels, No Parcels, Erroneous).
+    """
     
-    with pd.ExcelWriter(path, engine='xlsxwriter') as writer:
-        for filename in all_files:
-            file_path = os.path.join(input_dir, filename)
-            base = filename.rsplit('.', 1)[0]
-            try:
-                if filename.lower().endswith('.csv'):
-                    pd.read_csv(file_path).to_excel(writer, sheet_name=clean_sheet_name(base), index=False)
-                else:
-                    sheets = pd.read_excel(file_path, sheet_name=None)
-                    for s, df in sheets.items():
-                        writer_name = clean_sheet_name(f"{base}_{s}" if len(sheets)>1 else base)
-                        df.to_excel(writer, sheet_name=writer_name[:31], index=False)
-                print(f"✅ Added: {filename}")
-            except: pass
-    print(f"🎉 Saved: {path}")
+    REQUIRED_PROVINCES = {
+        "AKLAN", "ANTIQUE", "CAPIZ", "ILOILO", "GUIMARAS", "NEGROS OCCIDENTAL"
+    }
+    
+    print("\n--- Starting Regional Consolidation (Mode 3) ---")
+    print("Required Provinces: ", ", ".join(REQUIRED_PROVINCES))
+
+    files = [f for f in os.listdir(input_dir) if f.endswith('.xlsx') and not f.startswith('~$')]
+    
+    if not files:
+        print("❌ No Excel files found in input directory.")
+        return
+
+    province_map = {} # {'AKLAN': 'filename.xlsx'}
+    
+    # --- STEP 1: INVENTORY & VALIDATION ---
+    print("\n🔍 Scanning files...")
+    
+    for f in files:
+        f_path = os.path.join(input_dir, f)
+        try:
+            # We only need to peek at 'Clean - With Parcels' to find the province
+            # Reading only columns needed to identify province to save memory
+            df_peek = pd.read_excel(f_path, sheet_name='Clean - With Parcels', nrows=50)
+            
+            # Find province column (user specified: farmer_address_prv)
+            col_prov = next((c for c in df_peek.columns if 'farmer_address_prv' in c.lower()), None)
+            
+            if not col_prov:
+                print(f"⚠️  Skipping {f}: Column 'farmer_address_prv' not found.")
+                continue
+                
+            # Extract Province Name (Get first non-null value)
+            prov_list = df_peek[col_prov].dropna().unique()
+            if len(prov_list) == 0:
+                print(f"⚠️  Skipping {f}: No province data found in column.")
+                continue
+            
+            # Normalize found province
+            detected_prov = str(prov_list[0]).strip().upper()
+            
+            # Handle variations (e.g. "ILOILO PROVINCE" -> "ILOILO")
+            # Simple substring matching against required list
+            matched_key = None
+            for req in REQUIRED_PROVINCES:
+                if req in detected_prov:
+                    matched_key = req
+                    break
+            
+            if not matched_key:
+                print(f"⚠️  Skipping {f}: Detected province '{detected_prov}' is not in Region 6 list.")
+                continue
+                
+            # CHECK FOR DUPLICATES
+            if matched_key in province_map:
+                print(f"❌ CRITICAL ERROR: Duplicate files found for {matched_key}!")
+                print(f"   File 1: {province_map[matched_key]}")
+                print(f"   File 2: {f}")
+                print("   Strict Mode requires exactly one file per province.")
+                return
+
+            province_map[matched_key] = f
+            print(f"   ✅ Mapped {matched_key.ljust(18)} -> {f}")
+
+        except ValueError:
+            # Sheet might not exist if file wasn't generated by Mode 2
+            print(f"⚠️  Skipping {f}: Sheet 'Clean - With Parcels' missing.")
+        except Exception as e:
+            print(f"⚠️  Error reading {f}: {e}")
+
+    # --- STEP 2: STRICT COMPLETENESS CHECK ---
+    found_provinces = set(province_map.keys())
+    missing = REQUIRED_PROVINCES - found_provinces
+    
+    if missing:
+        print(f"\n❌ CRITICAL ERROR: Missing files for: {', '.join(missing)}")
+        print("   Mode 3 requires all 6 provinces to be present to generate the Regional Report.")
+        return
+        
+    print("\n✅ All Provinces Accounted For. Merging Data...")
+
+    # --- STEP 3: CONSOLIDATION ---
+    
+    outputs = {
+        'With_Parcels': {'sheet_src': 'Clean - With Parcels', 'filename': 'Regional_With_Parcels.xlsx'},
+        'No_Parcels':   {'sheet_src': 'Clean - No Parcels',   'filename': 'Regional_No_Parcels.xlsx'},
+        'Erroneous':    {'sheet_src': 'Erroneous & Conflicts','filename': 'Regional_Erroneous.xlsx'}
+    }
+
+    try:
+        for key, config in outputs.items():
+            out_path = os.path.join(output_dir, config['filename'])
+            print(f"   generating {config['filename']}...")
+            
+            with pd.ExcelWriter(out_path, engine='xlsxwriter') as writer:
+                # Iterate through provinces in specific order
+                for prov in sorted(list(REQUIRED_PROVINCES)):
+                    f_name = province_map[prov]
+                    f_path = os.path.join(input_dir, f_name)
+                    
+                    # Load the specific sheet
+                    try:
+                        df_sheet = pd.read_excel(f_path, sheet_name=config['sheet_src'])
+                        
+                        # Write to Regional File (Tab Name = Province)
+                        df_sheet.to_excel(writer, sheet_name=prov, index=False)
+                        
+                        # Optional: Add Red Formatting for Error File
+                        if key == 'Erroneous':
+                            wb = writer.book
+                            ws = writer.sheets[prov]
+                            red_fmt = wb.add_format({'font_color': '#9C0006', 'bg_color': '#FFC7CE'})
+                            ws.conditional_format(1, 0, len(df_sheet), 0, {'type': 'no_blanks', 'format': red_fmt})
+                            
+                    except Exception as e:
+                        print(f"   ⚠️ Could not read {config['sheet_src']} from {prov}: {e}")
+        
+        print("\n🎉 Regional Consolidation Complete!")
+
+    except Exception as e:
+        print(f"❌ Error during merging: {e}")
 
 # --- MODE 4: REGIONAL SUMMARY (Renamed from 3) ---
 
@@ -968,7 +961,7 @@ def run_cli_app():
             if m: 
                 p = select_input_file(input_dir, "Select Parcel List")
                 if p: process_masterlist_merger(m, p, output_dir)
-        elif choice == "3": run_combine_sheets(input_dir, output_dir)
+        elif choice == "3": run_regional_consolidation(input_dir, output_dir)
         elif choice == "4":
             t = select_input_file(input_dir); 
             if t: process_rsbsa_report(t, output_dir)
