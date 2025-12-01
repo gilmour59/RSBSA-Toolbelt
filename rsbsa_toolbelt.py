@@ -640,37 +640,34 @@ def run_regional_consolidation(input_dir, output_dir):
 
 def run_regional_analytics_mode4(input_dir, output_dir):
     """
-    MODE 4: FARMERS REGISTRY GENERATOR (ANALYTICS / SUMMARY)
+    MODE 4: FARMERS REGISTRY GENERATOR (FINAL)
     
-    Status: AGE CALCULATION FIXED
-    - Uses user-provided 'As Of' date for age computation.
-    - Aggregates by Municipality -> Barangay.
-    - Counts Demographics & Sectors.
-    - Sums Land Areas.
+    Updates:
+    - Ownership: Separated into 4 Count Columns (Owner, Tenant, Lessee, Others).
+    - Removed: Farm Type.
+    - Headers: Strictly at Row 5.
+    - Formatting: Full Borders.
     """
     print("\n--- Starting Farmers Registry Generation (Mode 4: Analytics) ---")
     
     # 1. Ask for Date
     as_of_input = input("Enter 'As Of' Date (e.g. Sept 30, 2025): ").strip()
     
-    # Parse Date for Calculation
     try:
         if not as_of_input:
             ref_date = datetime.now()
             as_of_date = ref_date.strftime("%b %d, %Y")
         else:
-            # Flexible parsing using pandas
             ref_date = pd.to_datetime(as_of_input)
-            as_of_date = as_of_input # Keep original string for display
+            as_of_date = as_of_input
     except:
-        print(f"   ⚠️ Invalid date format '{as_of_input}'. Using Today.")
         ref_date = datetime.now()
         as_of_date = ref_date.strftime("%b %d, %Y")
 
     safe_date = "".join([c for c in as_of_date if c.isalnum() or c in (' ', '-', '_')]).strip()
     
     # ==========================================
-    # PART A: CLEAN ANALYTICS (SUMMARY)
+    # PART A: CLEAN ANALYTICS
     # ==========================================
     print(f"\n🔹 Generating Clean Registry Analytics (As of {as_of_date})...")
     
@@ -694,11 +691,10 @@ def run_regional_analytics_mode4(input_dir, output_dir):
 
     if not df_clean.empty:
         with LoadingSpinner("Aggregating Analytics..."):
-            # 1. Normalize columns
             df_clean.columns = [c.strip().lower() for c in df_clean.columns]
             df_clean = df_clean.loc[:, ~df_clean.columns.duplicated()]
 
-            # 2. Map Columns
+            # --- COLUMN MAPPING ---
             col_prov = 'province_sheet'
             col_mun = next((c for c in df_clean.columns if 'mun' in c and 'address' in c), 'farmer_address_mun')
             col_bgy = next((c for c in df_clean.columns if 'bgy' in c and 'address' in c), 'farmer_address_bgy')
@@ -708,32 +704,35 @@ def run_regional_analytics_mode4(input_dir, output_dir):
             col_sex = next((c for c in df_clean.columns if 'sex' in c or 'gender' in c), None)
             col_bday = next((c for c in df_clean.columns if 'birth' in c), None)
             
-            # Types
+            # Farmer Types
             col_frm = next((c for c in df_clean.columns if 'farmer' == c), None)
             col_wrk = next((c for c in df_clean.columns if 'farmworker' in c), None)
             col_fsh = next((c for c in df_clean.columns if 'fisher' in c), None)
             col_agency = next((c for c in df_clean.columns if 'agency' in c), None)
 
-            # New Metrics (Sectoral)
+            # Sectoral
             col_youth = next((c for c in df_clean.columns if 'youth' in c), None)
             col_ip    = next((c for c in df_clean.columns if 'ip' in c), None)
             col_tribe = next((c for c in df_clean.columns if 'tribe' in c), None)
+            col_arb   = next((c for c in df_clean.columns if 'arb' in c), None)
 
-            # New Metrics (Areas)
+            # Parcel Details
+            col_multi = next((c for c in df_clean.columns if 'multiple' in c), None)
+            col_comm  = next((c for c in df_clean.columns if 'commodity' in c or 'commodities' in c), None)
+            col_own   = next((c for c in df_clean.columns if 'ownership' in c), None)
+
+            # Areas
             col_area = next((c for c in df_clean.columns if 'crop_area' in c or 'parcel area' in c), None)
             if not col_area: col_area = next((c for c in df_clean.columns if 'total_parcel_area' in c), None)
-            
-            col_comm = next((c for c in df_clean.columns if 'commodity' in c or 'commodities' in c), None)
 
-            # AGE CALCULATION (USING REFERENCE DATE)
+            # Age Calculation
             if col_bday:
                 df_clean[col_bday] = pd.to_datetime(df_clean[col_bday], errors='coerce')
-                # Calculate age relative to ref_date
                 df_clean['AGE'] = (ref_date - df_clean[col_bday]).dt.days // 365
             else:
                 df_clean['AGE'] = 0
 
-            # 3. Aggregation Logic
+            # --- AGGREGATION ---
             clean_outputs = {}
 
             if col_prov in df_clean.columns:
@@ -741,35 +740,58 @@ def run_regional_analytics_mode4(input_dir, output_dir):
                     prov_df = df_clean[df_clean[col_prov] == prov]
                     rows = []
                     
-                    # Group by Mun/Bgy
                     for (mun, bgy), group in prov_df.groupby([col_mun, col_bgy]):
                         
-                        # --- METRIC SET 1: Based on UNIQUE IDs (Head Count) ---
+                        # Set 1: UNIQUE FARMERS (Head Count)
                         unique_farmers = group.drop_duplicates(subset=[col_id])
                         
-                        # Types
+                        # Counts
                         n_farmers = unique_farmers[col_frm].astype(str).str.upper().apply(lambda x: 1 if 'YES' in x or 'TRUE' in x else 0).sum() if col_frm else 0
                         n_workers = unique_farmers[col_wrk].astype(str).str.upper().apply(lambda x: 1 if 'YES' in x or 'TRUE' in x else 0).sum() if col_wrk else 0
                         n_fisher  = unique_farmers[col_fsh].astype(str).str.upper().apply(lambda x: 1 if 'YES' in x or 'TRUE' in x else 0).sum() if col_fsh else 0
                         
-                        # Gender
+                        # Demographics
                         n_male = 0; n_female = 0
                         if col_sex:
                             n_male = len(unique_farmers[unique_farmers[col_sex].astype(str).str.upper().isin(['M', 'MALE'])])
                             n_female = len(unique_farmers[unique_farmers[col_sex].astype(str).str.upper().isin(['F', 'FEMALE'])])
                         
-                        # Age (Using the correctly calculated 'AGE' column)
                         n_youth_age = len(unique_farmers[unique_farmers['AGE'].between(12, 30)])
                         n_working   = len(unique_farmers[unique_farmers['AGE'].between(31, 59)])
                         n_senior    = len(unique_farmers[unique_farmers['AGE'] >= 60])
                         
                         # Sectoral Counts
-                        cnt_agri_y = 0; cnt_ip = 0; cnt_tribe = 0
-                        if col_youth: cnt_agri_y = unique_farmers[col_youth].astype(str).str.upper().apply(lambda x: 1 if 'YES' in x else 0).sum()
-                        if col_ip: cnt_ip = unique_farmers[col_ip].astype(str).str.upper().apply(lambda x: 1 if 'YES' in x else 0).sum()
-                        if col_tribe: cnt_tribe = unique_farmers[col_tribe].astype(str).str.upper().apply(lambda x: 1 if x not in ['NAN', 'NONE', ''] else 0).sum()
+                        def count_yes(c): 
+                            return unique_farmers[c].astype(str).str.upper().apply(lambda x: 1 if 'YES' in x or 'TRUE' in x else 0).sum() if c else 0
+                        
+                        cnt_agri_y = count_yes(col_youth)
+                        cnt_ip = count_yes(col_ip)
+                        cnt_arb = count_yes(col_arb)
+                        cnt_multi = count_yes(col_multi)
+                        
+                        cnt_tribe = 0
+                        if col_tribe: 
+                            cnt_tribe = unique_farmers[col_tribe].astype(str).str.upper().apply(lambda x: 1 if x not in ['NAN', 'NONE', ''] else 0).sum()
 
-                        # Distinct Agencies
+                        # Ownership Counts (Specific Categories)
+                        n_owner = 0; n_tenant = 0; n_lessee = 0; n_others = 0
+                        if col_own:
+                            # We check distinct farmers who have at least one parcel with this status
+                            def count_own(keyword):
+                                # Filter unique farmers who have 'keyword' in their ownership column
+                                # Note: col_own might be comma separated if aggregated, but here we have granular rows from Mode 2? 
+                                # Mode 3 merges them. If Mode 2 was granular, Mode 3 output is granular.
+                                # So 'group' has multiple rows.
+                                # We need to find unique IDs where column contains keyword.
+                                subset = group[group[col_own].astype(str).str.upper().str.contains(keyword, na=False)]
+                                return subset[col_id].nunique()
+
+                            n_owner = count_own('OWNER')
+                            n_tenant = count_own('TENANT')
+                            n_lessee = count_own('LESSEE')
+                            n_others = count_own('OTHER')
+
+                        # Agencies
                         n_agencies = 0
                         if col_agency:
                             raw = unique_farmers[col_agency].dropna().astype(str).tolist()
@@ -780,62 +802,90 @@ def run_regional_analytics_mode4(input_dir, output_dir):
                                     if clean_a and clean_a not in ['NAN', 'NONE', '']: uset.add(clean_a)
                             n_agencies = len(uset)
 
-                        # --- METRIC SET 2: Based on ALL ROWS (Parcels) ---
-                        # Area Sums
+                        # Set 2: ALL ROWS (Parcel Attributes)
+                        # Aggregate Text (Unique Values for Commodities)
+                        def get_unique_str(col):
+                            if not col: return ""
+                            vals = group[col].dropna().astype(str).unique()
+                            clean_vals = sorted(list(set([v.strip().title() for v in vals if v.strip().upper() not in ['NAN', 'NONE', '']])))
+                            return ", ".join(clean_vals)
+
+                        txt_comm = get_unique_str(col_comm)
+
+                        # Areas
                         tot_area = 0; rice_area = 0; corn_area = 0; sugar_area = 0
-                        
                         if col_area:
                             group[col_area] = pd.to_numeric(group[col_area], errors='coerce').fillna(0)
                             tot_area = group[col_area].sum()
                             
                             if col_comm:
-                                def get_comm_area(comm_keyword):
-                                    mask = group[col_comm].astype(str).str.upper().str.contains(comm_keyword, na=False)
+                                def get_comm_area(k):
+                                    mask = group[col_comm].astype(str).str.upper().str.contains(k, na=False)
                                     return group.loc[mask, col_area].sum()
-                                
                                 rice_area = get_comm_area('RICE') + get_comm_area('PALAY')
                                 corn_area = get_comm_area('CORN') + get_comm_area('MAIS')
                                 sugar_area = get_comm_area('SUGAR') + get_comm_area('CANE')
 
+                        # BUILD ROW
                         rows.append({
                             'Municipality': mun, 'Barangay': bgy,
                             'Farmers': n_farmers, 'Farmworkers': n_workers, 'Fisherfolk': n_fisher,
-                            'AgriYouth': cnt_agri_y, 'IP Members': cnt_ip, 'With Tribe': cnt_tribe,
+                            'AgriYouth': cnt_agri_y, 'IP': cnt_ip, 'With Tribe': cnt_tribe, 
+                            'ARB': cnt_arb, 'Multi-Parcel Holders': cnt_multi,
                             'Distinct Agencies': n_agencies,
                             'Male': n_male, 'Female': n_female,
-                            'Youth (12-30)': n_youth_age, 'Working Age (31-59)': n_working, 'Senior (60+)': n_senior,
-                            'Total Area (Ha)': tot_area, 'Rice Area': rice_area, 'Corn Area': corn_area, 'Sugar Area': sugar_area
+                            'Youth (12-30)': n_youth_age, 'Working (31-59)': n_working, 'Senior (60+)': n_senior,
+                            'Registered Owner': n_owner, 'Tenant': n_tenant, 'Lessee': n_lessee, 'Others': n_others,
+                            'Total Area (Ha)': tot_area, 'Rice Area': rice_area, 'Corn Area': corn_area, 'Sugar Area': sugar_area,
+                            'Commodities': txt_comm
                         })
                     
                     if rows:
                         df_res = pd.DataFrame(rows).sort_values(by=['Municipality', 'Barangay'])
                         clean_outputs[prov] = df_res
 
-        # Save Clean Analytics
+        # SAVE CLEAN
         clean_file = f"Farmers Registry {safe_date}.xlsx"
         try:
             with pd.ExcelWriter(os.path.join(output_dir, clean_file), engine='xlsxwriter') as writer:
                 wb = writer.book
+                # Formats
                 title_fmt = wb.add_format({'bold': True, 'font_size': 14})
                 sub_fmt = wb.add_format({'italic': True})
-                header_fmt = wb.add_format({'bold': True, 'bg_color': '#D9E1F2', 'border': 1, 'align': 'center', 'valign': 'vcenter'})
+                header_fmt = wb.add_format({'bold': True, 'bg_color': '#D9E1F2', 'border': 1, 'align': 'center', 'valign': 'vcenter', 'text_wrap': True})
+                border_fmt = wb.add_format({'border': 1})
                 num_fmt = wb.add_format({'num_format': '#,##0', 'border': 1})
                 dec_fmt = wb.add_format({'num_format': '#,##0.00', 'border': 1})
+                text_border = wb.add_format({'border': 1, 'text_wrap': True})
                 
                 for prov, df in clean_outputs.items():
-                    df.to_excel(writer, sheet_name=prov, startrow=5, index=False)
+                    # Write Data at Row 6 (Index 5)
+                    df.to_excel(writer, sheet_name=prov, startrow=5, index=False, header=False)
+                    
                     ws = writer.sheets[prov]
                     
                     ws.write(0, 0, f"RSBSA Summary Report - {prov}", title_fmt)
                     ws.write(1, 0, f"\"As of: {as_of_date}\"", sub_fmt)
-                    ws.write(2, 0, "Age Legend: Youth (12-30) | Working Age (31-59) | Senior (60+)", sub_fmt)
+                    ws.write(2, 0, "Age Legend: Youth (12-30) | Working (31-59) | Senior (60+)", sub_fmt)
                     
+                    # Headers at Row 5 (Index 4)
                     for i, col in enumerate(df.columns):
-                        ws.write(5, i, col, header_fmt)
+                        ws.write(4, i, col, header_fmt)
                     
-                    ws.set_column(0, 1, 25) # Mun/Bgy
-                    ws.set_column(2, 13, 12, num_fmt) # Counts
-                    ws.set_column(14, 17, 15, dec_fmt) # Areas
+                    # Formatting
+                    # Mun/Bgy
+                    ws.set_column(0, 1, 20, border_fmt)
+                    # Counts (C to P approx)
+                    ws.set_column(2, 19, 10, num_fmt)
+                    # Areas (T to W approx)
+                    ws.set_column(20, 23, 12, dec_fmt)
+                    # Commodities (X)
+                    ws.set_column(24, 24, 30, text_border)
+                    
+                    # Full Borders
+                    end_row = len(df) + 5
+                    end_col = len(df.columns) - 1
+                    ws.conditional_format(5, 0, end_row, end_col, {'type': 'no_errors', 'format': border_fmt})
             
             print(f"   ✅ Created Clean Analytics: {clean_file}")
             
@@ -844,9 +894,8 @@ def run_regional_analytics_mode4(input_dir, output_dir):
     else:
         print("   ⚠️ No Clean Data found.")
 
-
     # ==========================================
-    # PART B: ERRONEOUS ANALYTICS (SUMMARY)
+    # PART B: ERRONEOUS ANALYTICS
     # ==========================================
     print("\n🔹 Generating Erroneous Analytics...")
     
@@ -879,7 +928,6 @@ def run_regional_analytics_mode4(input_dir, output_dir):
                 prov_df = df_err[df_err[col_prov] == prov]
                 rows = []
                 
-                # Fill Missing
                 if col_mun in prov_df.columns: prov_df[col_mun] = prov_df[col_mun].fillna('UNKNOWN')
                 if col_bgy in prov_df.columns: prov_df[col_bgy] = prov_df[col_bgy].fillna('UNKNOWN')
                 
@@ -900,15 +948,15 @@ def run_regional_analytics_mode4(input_dir, output_dir):
                 if rows:
                     err_outputs[prov] = pd.DataFrame(rows).sort_values(by=['Municipality', 'Barangay'])
 
-        # Save Erroneous Analytics
         err_out_file = f"Farmers Registry Erroneous {safe_date}.xlsx"
         try:
             with pd.ExcelWriter(os.path.join(output_dir, err_out_file), engine='xlsxwriter') as writer:
                 wb = writer.book
-                header_fmt = wb.add_format({'bold': True, 'bg_color': '#FFC7CE', 'font_color': '#9C0006', 'border': 1})
+                header_fmt = wb.add_format({'bold': True, 'bg_color': '#FFC7CE', 'font_color': '#9C0006', 'border': 1, 'align': 'center'})
+                border_fmt = wb.add_format({'border': 1})
                 
                 for prov, df in err_outputs.items():
-                    df.to_excel(writer, sheet_name=prov, startrow=4, index=False)
+                    df.to_excel(writer, sheet_name=prov, startrow=4, index=False, header=False)
                     ws = writer.sheets[prov]
                     ws.write(0, 0, f"Erroneous Summary - {prov}", wb.add_format({'bold': True, 'font_size': 14, 'font_color': '#9C0006'}))
                     ws.write(1, 0, f"As of: {as_of_date}")
@@ -918,6 +966,8 @@ def run_regional_analytics_mode4(input_dir, output_dir):
                         
                     ws.set_column(0, 1, 25)
                     ws.set_column(2, 5, 18)
+                    ws.conditional_format(5, 0, len(df)+4, len(df.columns)-1, 
+                                          {'type': 'no_errors', 'format': border_fmt})
             
             print(f"   ✅ Created Erroneous Analytics: {err_out_file}")
             
