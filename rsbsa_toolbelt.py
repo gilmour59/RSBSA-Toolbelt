@@ -210,14 +210,16 @@ def calculate_polygon_area(lats, lons):
 
 def process_masterlist_merger(master_path, parcel_path, output_dir):
     """
-    MODE 2: TRIAGE SYSTEM
-    Separates data into 3 distinct sheets:
-    1. CLEAN - WITH PARCELS (Ready for processing)
-    2. CLEAN - NO PARCELS (For follow-up)
-    3. ERRONEOUS / CONFLICTS (Duplicates, Identity Issues - Quarantine)
+    MODE 2: TRIAGE SYSTEM (Granular - One Row Per Parcel)
+    
+    Logic:
+    1. Identify Clean vs Erroneous Farmers in Masterlist.
+    2. JOIN Clean Farmers with Parcel List (One-to-Many).
+    3. Calculate 'HAS_MULTIPLE_LAND_HOLDINGS'.
+    4. Separate into 'With Parcels', 'No Parcels', 'Erroneous'.
     """
     
-    # NEW NAMING CONVENTION: {MasterlistName}-merged.xlsx
+    # Naming: {MasterlistName}-merged.xlsx
     base_name = os.path.splitext(os.path.basename(master_path))[0]
     output_filename = f"{base_name}-merged.xlsx"
     output_path = os.path.join(output_dir, output_filename)
@@ -240,31 +242,44 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
             
             df_m['KEY_ID'] = df_m[col_rsbsa].astype(str).str.strip().str.upper()
             df_m['DATA_STATUS'] = 'CLEAN' 
-            df_m['ERROR_TAG'] = ''        
+            df_m['ERROR_TAG'] = ''   
 
         # --- 2. LOAD PARCEL LIST ---
         with LoadingSpinner("Loading Parcel List..."):
             if parcel_path.lower().endswith('.csv'): df_p = pd.read_csv(parcel_path)
             else: df_p = pd.read_excel(parcel_path)
             
+            # Preserve original column names for output, but lower them for searching
+            original_p_cols = list(df_p.columns)
             df_p.columns = [c.strip().lower() for c in df_p.columns]
             
+            # Find Key Columns
             col_ffrs = next((c for c in df_p.columns if 'ffrs' in c or 'system generated' in c), None)
-            col_area = next((c for c in df_p.columns if 'parcel area' in c or 'crop area' in c), None)
-            col_comm = next((c for c in df_p.columns if 'commodity' in c), None)
             
             if not col_ffrs:
                 print("❌ Error: FFRS ID column not found in Parcel List.")
                 return
             
+            # Create Key
             df_p['KEY_ID'] = df_p[col_ffrs].astype(str).str.strip().str.upper()
-            if col_area: df_p[col_area] = pd.to_numeric(df_p[col_area], errors='coerce').fillna(0)
-            df_p['NORM_COMM'] = df_p[col_comm].apply(normalize_commodity)
+            
+            # FLAG MULTIPLE HOLDINGS (New Feature)
+            # Count how many times each ID appears in the parcel list
+            df_p['parcel_count_temp'] = df_p.groupby('KEY_ID')['KEY_ID'].transform('count')
+            df_p['HAS_MULTIPLE_LAND_HOLDINGS'] = df_p['parcel_count_temp'].apply(lambda x: 'YES' if x > 1 else 'NO')
+            
+            # Restore original column names (mapped) so output looks nice
+            # We map the lowercase cols back to original, but keep KEY_ID and HAS_MULTIPLE...
+            col_map = {c.strip().lower(): c for c in original_p_cols}
+            
+            # We need to drop the temporary lowercased columns and keep the calculated ones + Original content
+            # Strategy: Rename the current lowercased columns back to Title Case
+            df_p = df_p.rename(columns=col_map)
 
         # --- 3. FLAGGING ERRORS (TRIAGE) ---
         with LoadingSpinner("Triaging: Detecting Duplicates & Conflicts..."):
             
-            # A. STRICT DUPLICATE IDs
+            # A. STRICT DUPLICATE IDs (Masterlist side)
             dup_mask = df_m.duplicated(subset=['KEY_ID'], keep=False)
             df_m.loc[dup_mask, 'DATA_STATUS'] = 'ERROR'
             df_m.loc[dup_mask, 'ERROR_TAG'] += '[Duplicate RSBSA ID] '
@@ -301,56 +316,86 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
                 df_m.loc[is_conflict, 'DATA_STATUS'] = 'ERROR'
                 df_m.loc[is_conflict, 'ERROR_TAG'] += '[Identity Conflict] '
 
-        # --- 4. MERGE PARCELS ---
-        with LoadingSpinner("Linking Parcels to Farmers..."):
-            parcel_summary = df_p.groupby('KEY_ID').agg({
-                col_comm: lambda x: ', '.join(sorted(list(set(x.dropna().astype(str))))),
-                col_area: 'sum',
-                'KEY_ID': 'count'
-            }).rename(columns={col_comm: 'PARCEL_COMMODITIES', col_area: 'TOTAL_PARCEL_AREA_HA', 'KEY_ID': 'PARCEL_COUNT'})
+        # --- 4. MERGING (ONE-TO-MANY) ---
+        with LoadingSpinner("Merging Masterlist with Parcels..."):
             
-            for crop in ['RICE', 'CORN', 'SUGAR']:
-                crop_area = df_p[df_p['NORM_COMM'] == crop].groupby('KEY_ID')[col_area].sum()
-                parcel_summary[f'AREA_{crop}_HA'] = crop_area
+            # Split Masterlist into Clean and Error
+            df_m_clean = df_m[df_m['DATA_STATUS'] == 'CLEAN'].copy()
+            df_m_error = df_m[df_m['DATA_STATUS'] == 'ERROR'].copy()
+            
+            # MERGE STEP: Left Join Clean Farmers -> Parcel List
+            # This preserves multiple rows for the same farmer
+            df_merged = pd.merge(df_m_clean, df_p, on='KEY_ID', how='left')
+            
+            # Determine status based on merge
+            # If a column from df_p is NaN, it means they have no parcel
+            # We pick a column we know exists in df_p to check, e.g., 'HAS_MULTIPLE_LAND_HOLDINGS'
+            df_merged['HAS_PARCEL'] = df_merged['HAS_MULTIPLE_LAND_HOLDINGS'].notna()
+            
+            # Fill NaN for farmers with no parcels
+            df_merged['HAS_MULTIPLE_LAND_HOLDINGS'] = df_merged['HAS_MULTIPLE_LAND_HOLDINGS'].fillna('NO')
 
-            parcel_summary.fillna(0, inplace=True)
-            df_final = pd.merge(df_m, parcel_summary, on='KEY_ID', how='left')
+        # --- 5. SPLIT, SORT & SAVE ---
+        with LoadingSpinner("Splitting and Sorting..."):
             
-            cols_to_fill = ['PARCEL_COUNT', 'TOTAL_PARCEL_AREA_HA', 'AREA_RICE_HA', 'AREA_CORN_HA', 'AREA_SUGAR_HA']
-            df_final[cols_to_fill] = df_final[cols_to_fill].fillna(0)
-            df_final['PARCEL_COMMODITIES'] = df_final['PARCEL_COMMODITIES'].fillna('None')
+            # Split into the 3 buckets
+            df_with = df_merged[df_merged['HAS_PARCEL'] == True].copy()
+            df_no = df_merged[df_merged['HAS_PARCEL'] == False].copy()
+            
+            # Clean up columns (Remove helper cols)
+            drop_cols = ['LOOSE_SIG', 'DATA_STATUS', 'ERROR_TAG', 'HAS_PARCEL', 'parcel_count_temp']
+            final_cols_with = [c for c in df_with.columns if c not in drop_cols]
+            final_cols_no = [c for c in df_no.columns if c not in drop_cols and c not in df_p.columns] # Remove parcel cols from 'No Parcel' sheet
+            
+            # Re-attach the basic Masterlist columns for the "No Parcel" sheet if they got dropped
+            # Actually, the merge keeps them. We just want to ensure we don't show empty Parcel columns for "No Parcel" guys.
+            # Strategy: Keep only Masterlist columns for df_no
+            df_no = df_no[[c for c in df_m.columns if c not in ['LOOSE_SIG', 'DATA_STATUS', 'ERROR_TAG']]]
+            
+            # --- SORTING LOGIC ---
+            # Municipality -> Barangay -> Last Name -> (New) Parcel Address/Commodity
+            sort_keys = []
+            m_mun = next((c for c in df_with.columns if 'mun' in c.lower() and 'address' in c.lower()), None)
+            m_bgy = next((c for c in df_with.columns if 'bgy' in c.lower() and 'address' in c.lower()), None)
+            m_last = next((c for c in df_with.columns if 'last' in c.lower() and 'name' in c.lower()), None)
+            
+            if m_mun: sort_keys.append(m_mun)
+            if m_bgy: sort_keys.append(m_bgy)
+            if m_last: sort_keys.append(m_last)
+            
+            if sort_keys:
+                print(f"   Sorting by: {' -> '.join(sort_keys)}")
+                df_with.sort_values(by=sort_keys, inplace=True)
+                df_no.sort_values(by=sort_keys, inplace=True)
+                if 'ERROR_TAG' in df_m_error.columns:
+                     # For errors, we need to ensure the sort keys exist (they are from masterlist)
+                     err_sort = ['ERROR_TAG'] + [k for k in sort_keys if k in df_m_error.columns]
+                     df_m_error.sort_values(by=err_sort, inplace=True)
 
-        # --- 5. SPLIT & SAVE ---
-        with LoadingSpinner("Splitting and Saving..."):
-            base_cols = list(df_m.columns)
-            cols_clean = [c for c in base_cols if c not in ['LOOSE_SIG', 'DATA_STATUS', 'ERROR_TAG', 'KEY_ID']]
-            cols_parcel = ['PARCEL_COUNT', 'TOTAL_PARCEL_AREA_HA', 'PARCEL_COMMODITIES', 'AREA_RICE_HA', 'AREA_CORN_HA', 'AREA_SUGAR_HA']
-            final_col_order = cols_clean + cols_parcel
-            
-            df_errors = df_final[df_final['DATA_STATUS'] == 'ERROR'].copy()
-            df_clean = df_final[df_final['DATA_STATUS'] == 'CLEAN'].copy()
-            
-            df_with = df_clean[df_clean['PARCEL_COUNT'] > 0].copy()
-            df_no = df_clean[df_clean['PARCEL_COUNT'] == 0].copy()
-
+            # SAVE
             with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
-                df_with[final_col_order].to_excel(writer, sheet_name='Clean - With Parcels', index=False)
-                df_no[final_col_order].to_excel(writer, sheet_name='Clean - No Parcels', index=False)
-                err_cols = ['ERROR_TAG', 'KEY_ID'] + final_col_order
-                err_cols = [c for c in err_cols if c in df_errors.columns]
-                df_errors[err_cols].to_excel(writer, sheet_name='Erroneous & Conflicts', index=False)
+                df_with.to_excel(writer, sheet_name='Clean - With Parcels', index=False)
+                df_no.to_excel(writer, sheet_name='Clean - No Parcels', index=False)
                 
-                # Red highlight for errors
+                # For Error Sheet, we only have Masterlist data (no merge done on errors)
+                # But we might want to see if those errors *had* parcels. 
+                # For now, following strict logic: Errors are quarantined before merging.
+                df_m_error.to_excel(writer, sheet_name='Erroneous & Conflicts', index=False)
+                
+                # Formatting
                 wb = writer.book
                 ws_err = writer.sheets['Erroneous & Conflicts']
                 red_fmt = wb.add_format({'font_color': '#9C0006', 'bg_color': '#FFC7CE'})
-                ws_err.conditional_format(1, 0, len(df_errors), 0, {'type': 'no_blanks', 'format': red_fmt})
+                ws_err.conditional_format(1, 0, len(df_m_error), 0, {'type': 'no_blanks', 'format': red_fmt})
 
         print(f"🎉 Processed: {output_filename}")
+        print(f"   (Granular Format: Multiple rows per farmer preserved)")
 
     except Exception as e:
         print(f"❌ Error: {e}")
-
+        import traceback
+        traceback.print_exc()
+        
 # --- MODE 1: STACK ROWS ---
 
 def run_stack_rows(input_dir, output_dir):
@@ -398,19 +443,19 @@ def run_stack_rows(input_dir, output_dir):
 
 def run_regional_consolidation(input_dir, output_dir):
     """
-    MODE 3: REGIONAL CONSOLIDATOR
+    MODE 3: REGIONAL CONSOLIDATOR (Flexible)
     1. Scans input folder for Mode 2 outputs.
-    2. VALIDATION: Ensures exactly one file exists for each of the 6 Region 6 provinces.
-    3. PROCESSING: Combines them into 3 Master Files (With Parcels, No Parcels, Erroneous).
+    2. VALIDATION: 
+       - STRICT: No Duplicates (e.g., cannot have 2 Aklan files).
+       - RELAXED: Allows incomplete sets (e.g., can run with just 3 provinces).
+    3. PROCESSING: Combines available files into 3 Master Files.
     """
     
-    REQUIRED_PROVINCES = {
-        "AKLAN", "ANTIQUE", "CAPIZ", "ILOILO", "GUIMARAS", "NEGROS OCCIDENTAL"
-    }
-    
     print("\n--- Starting Regional Consolidation (Mode 3) ---")
-    print("Required Provinces: ", ", ".join(REQUIRED_PROVINCES))
-
+    
+    # We use the global REQUIRED_PROVINCES to validate file contents, 
+    # but we don't force all of them to be present.
+    
     files = [f for f in os.listdir(input_dir) if f.endswith('.xlsx') and not f.startswith('~$')]
     
     if not files:
@@ -425,28 +470,25 @@ def run_regional_consolidation(input_dir, output_dir):
     for f in files:
         f_path = os.path.join(input_dir, f)
         try:
-            # We only need to peek at 'Clean - With Parcels' to find the province
-            # Reading only columns needed to identify province to save memory
+            # Peek at 'Clean - With Parcels' to identify province
+            # Reading only 50 rows for speed
             df_peek = pd.read_excel(f_path, sheet_name='Clean - With Parcels', nrows=50)
             
-            # Find province column (user specified: farmer_address_prv)
+            # Find province column
             col_prov = next((c for c in df_peek.columns if 'farmer_address_prv' in c.lower()), None)
             
             if not col_prov:
                 print(f"⚠️  Skipping {f}: Column 'farmer_address_prv' not found.")
                 continue
                 
-            # Extract Province Name (Get first non-null value)
             prov_list = df_peek[col_prov].dropna().unique()
             if len(prov_list) == 0:
-                print(f"⚠️  Skipping {f}: No province data found in column.")
+                print(f"⚠️  Skipping {f}: No province data found.")
                 continue
             
-            # Normalize found province
             detected_prov = str(prov_list[0]).strip().upper()
             
-            # Handle variations (e.g. "ILOILO PROVINCE" -> "ILOILO")
-            # Simple substring matching against required list
+            # Match against valid Region 6 list
             matched_key = None
             for req in REQUIRED_PROVINCES:
                 if req in detected_prov:
@@ -454,39 +496,40 @@ def run_regional_consolidation(input_dir, output_dir):
                     break
             
             if not matched_key:
-                print(f"⚠️  Skipping {f}: Detected province '{detected_prov}' is not in Region 6 list.")
+                print(f"⚠️  Skipping {f}: Province '{detected_prov}' is not in Region 6 list.")
                 continue
                 
-            # CHECK FOR DUPLICATES
+            # STRICT DUPLICATE CHECK
             if matched_key in province_map:
                 print(f"❌ CRITICAL ERROR: Duplicate files found for {matched_key}!")
                 print(f"   File 1: {province_map[matched_key]}")
                 print(f"   File 2: {f}")
-                print("   Strict Mode requires exactly one file per province.")
+                print("   Strict Mode forbids duplicates. Please remove one.")
                 return
 
             province_map[matched_key] = f
             print(f"   ✅ Mapped {matched_key.ljust(18)} -> {f}")
 
         except ValueError:
-            # Sheet might not exist if file wasn't generated by Mode 2
-            print(f"⚠️  Skipping {f}: Sheet 'Clean - With Parcels' missing.")
+            print(f"⚠️  Skipping {f}: Not a valid Mode 2 output (missing sheets).")
         except Exception as e:
             print(f"⚠️  Error reading {f}: {e}")
 
-    # --- STEP 2: STRICT COMPLETENESS CHECK ---
+    # --- STEP 2: CHECKING COVERAGE (Relaxed) ---
     found_provinces = set(province_map.keys())
     missing = REQUIRED_PROVINCES - found_provinces
     
-    if missing:
-        print(f"\n❌ CRITICAL ERROR: Missing files for: {', '.join(missing)}")
-        print("   Mode 3 requires all 6 provinces to be present to generate the Regional Report.")
+    if not found_provinces:
+        print("\n❌ No valid province files found to merge.")
         return
-        
-    print("\n✅ All Provinces Accounted For. Merging Data...")
+
+    if missing:
+        print(f"\n⚠️  Note: Missing files for: {', '.join(missing)}")
+        print("   Proceeding with the available provinces only...")
+    else:
+        print("\n✅ All 6 Provinces Accounted For.")
 
     # --- STEP 3: CONSOLIDATION ---
-    
     outputs = {
         'With_Parcels': {'sheet_src': 'Clean - With Parcels', 'filename': 'Regional_With_Parcels.xlsx'},
         'No_Parcels':   {'sheet_src': 'Clean - No Parcels',   'filename': 'Regional_No_Parcels.xlsx'},
@@ -496,22 +539,18 @@ def run_regional_consolidation(input_dir, output_dir):
     try:
         for key, config in outputs.items():
             out_path = os.path.join(output_dir, config['filename'])
-            print(f"   generating {config['filename']}...")
+            print(f"   Generating {config['filename']}...")
             
             with pd.ExcelWriter(out_path, engine='xlsxwriter') as writer:
-                # Iterate through provinces in specific order
-                for prov in sorted(list(REQUIRED_PROVINCES)):
+                # Iterate through FOUND provinces (sorted alphabetically)
+                for prov in sorted(list(found_provinces)):
                     f_name = province_map[prov]
                     f_path = os.path.join(input_dir, f_name)
                     
-                    # Load the specific sheet
                     try:
                         df_sheet = pd.read_excel(f_path, sheet_name=config['sheet_src'])
-                        
-                        # Write to Regional File (Tab Name = Province)
                         df_sheet.to_excel(writer, sheet_name=prov, index=False)
                         
-                        # Optional: Add Red Formatting for Error File
                         if key == 'Erroneous':
                             wb = writer.book
                             ws = writer.sheets[prov]
