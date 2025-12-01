@@ -642,28 +642,37 @@ def run_regional_analytics_mode4(input_dir, output_dir):
     """
     MODE 4: FARMERS REGISTRY GENERATOR (ANALYTICS / SUMMARY)
     
-    Status: REVERTED TO SUMMARY
-    Output:
-      1. 'Farmers Registry {Date}.xlsx' (Barangay-level Counts & Sums)
-      2. 'Farmers Registry Erroneous {Date}.xlsx' (Barangay-level Error Counts)
-    
-    Features:
-      - Aggregates by Municipality -> Barangay.
-      - Counts Demographics (Youth/Senior/Gender).
-      - Counts Sectors (AgriYouth/IP/Tribe).
-      - Sums Land Areas (Rice/Corn/Sugar).
+    Status: AGE CALCULATION FIXED
+    - Uses user-provided 'As Of' date for age computation.
+    - Aggregates by Municipality -> Barangay.
+    - Counts Demographics & Sectors.
+    - Sums Land Areas.
     """
     print("\n--- Starting Farmers Registry Generation (Mode 4: Analytics) ---")
     
     # 1. Ask for Date
-    as_of_date = input("Enter 'As Of' Date (e.g. Sept 30, 2025): ").strip()
-    if not as_of_date: as_of_date = datetime.now().strftime("%b %d, %Y")
+    as_of_input = input("Enter 'As Of' Date (e.g. Sept 30, 2025): ").strip()
+    
+    # Parse Date for Calculation
+    try:
+        if not as_of_input:
+            ref_date = datetime.now()
+            as_of_date = ref_date.strftime("%b %d, %Y")
+        else:
+            # Flexible parsing using pandas
+            ref_date = pd.to_datetime(as_of_input)
+            as_of_date = as_of_input # Keep original string for display
+    except:
+        print(f"   ⚠️ Invalid date format '{as_of_input}'. Using Today.")
+        ref_date = datetime.now()
+        as_of_date = ref_date.strftime("%b %d, %Y")
+
     safe_date = "".join([c for c in as_of_date if c.isalnum() or c in (' ', '-', '_')]).strip()
     
     # ==========================================
     # PART A: CLEAN ANALYTICS (SUMMARY)
     # ==========================================
-    print("\n🔹 Generating Clean Registry Analytics...")
+    print(f"\n🔹 Generating Clean Registry Analytics (As of {as_of_date})...")
     
     clean_files = {
         'clean_with': 'Regional_With_Parcels.xlsx',
@@ -714,21 +723,17 @@ def run_regional_analytics_mode4(input_dir, output_dir):
             col_area = next((c for c in df_clean.columns if 'crop_area' in c or 'parcel area' in c), None)
             if not col_area: col_area = next((c for c in df_clean.columns if 'total_parcel_area' in c), None)
             
-            # We need commodity to split areas
             col_comm = next((c for c in df_clean.columns if 'commodity' in c or 'commodities' in c), None)
 
-            # Age Calculation
+            # AGE CALCULATION (USING REFERENCE DATE)
             if col_bday:
                 df_clean[col_bday] = pd.to_datetime(df_clean[col_bday], errors='coerce')
-                df_clean['AGE'] = (datetime.now() - df_clean[col_bday]).dt.days // 365
+                # Calculate age relative to ref_date
+                df_clean['AGE'] = (ref_date - df_clean[col_bday]).dt.days // 365
             else:
                 df_clean['AGE'] = 0
 
             # 3. Aggregation Logic
-            # We must be careful:
-            # - Head counts (Gender, Age, Farmer Type) need UNIQUE FARMERS.
-            # - Area sums need ALL PARCELS (Rows).
-            
             clean_outputs = {}
 
             if col_prov in df_clean.columns:
@@ -753,7 +758,7 @@ def run_regional_analytics_mode4(input_dir, output_dir):
                             n_male = len(unique_farmers[unique_farmers[col_sex].astype(str).str.upper().isin(['M', 'MALE'])])
                             n_female = len(unique_farmers[unique_farmers[col_sex].astype(str).str.upper().isin(['F', 'FEMALE'])])
                         
-                        # Age
+                        # Age (Using the correctly calculated 'AGE' column)
                         n_youth_age = len(unique_farmers[unique_farmers['AGE'].between(12, 30)])
                         n_working   = len(unique_farmers[unique_farmers['AGE'].between(31, 59)])
                         n_senior    = len(unique_farmers[unique_farmers['AGE'] >= 60])
@@ -784,7 +789,6 @@ def run_regional_analytics_mode4(input_dir, output_dir):
                             tot_area = group[col_area].sum()
                             
                             if col_comm:
-                                # Simple keyword matching for commodity sums
                                 def get_comm_area(comm_keyword):
                                     mask = group[col_comm].astype(str).str.upper().str.contains(comm_keyword, na=False)
                                     return group.loc[mask, col_area].sum()
@@ -793,7 +797,6 @@ def run_regional_analytics_mode4(input_dir, output_dir):
                                 corn_area = get_comm_area('CORN') + get_comm_area('MAIS')
                                 sugar_area = get_comm_area('SUGAR') + get_comm_area('CANE')
 
-                        # Build Row
                         rows.append({
                             'Municipality': mun, 'Barangay': bgy,
                             'Farmers': n_farmers, 'Farmworkers': n_workers, 'Fisherfolk': n_fisher,
