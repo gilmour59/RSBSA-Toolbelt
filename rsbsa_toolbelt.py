@@ -213,8 +213,9 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
     MODE 2: TRIAGE SYSTEM (Strict Mapping & Granular)
     
     Updates:
-    - Removed Address Validation (Prevents false positives).
-    - Keeps Masterlist Address as the official address.
+    - Integrity Check restricted to Birthday, Gender, and Sector (No Names/Addresses).
+    - Output preserves Masterlist columns (Left side) as the source of truth.
+    - False positives from spelling variations are eliminated.
     """
     
     base_name = os.path.splitext(os.path.basename(master_path))[0]
@@ -226,16 +227,18 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
     # --- DEFINING THE STRICT MAPPING ---
     # Key = Masterlist Column (The "Truth")
     # Value = Parcel List Column (The "Comparison Target")
-    # REMOVED: Addresses (to avoid false positives)
+    
+    # We COMMENT OUT Names and Addresses to prevent false positives.
+    # We only check critical bio-data that must match.
     INTEGRITY_MAP = {
         'rsbsa_no': 'FFRS System Generated No.',
-        'first_name': 'FIRST NAME',
-        'middle_name': 'MIDDLE NAME',
-        'last_name': 'LAST NAME',
-        'ext_name': 'EXT NAME',
-        # 'farmer_address_bgy': 'FARMER ADDRESS 1',  <-- DISABLED
-        # 'farmer_address_mun': 'FARMER ADDRESS 2',  <-- DISABLED
-        # 'farmer_address_prv': 'FARMER ADDRESS 3',  <-- DISABLED
+        # 'first_name': 'FIRST NAME',        <-- DISABLED (Too many false positives)
+        # 'middle_name': 'MIDDLE NAME',      <-- DISABLED
+        # 'last_name': 'LAST NAME',          <-- DISABLED
+        # 'ext_name': 'EXT NAME',            <-- DISABLED
+        # 'farmer_address_bgy': 'FARMER ADDRESS 1', <-- DISABLED
+        # 'farmer_address_mun': 'FARMER ADDRESS 2', <-- DISABLED
+        # 'farmer_address_prv': 'FARMER ADDRESS 3', <-- DISABLED
         'birthday': 'BIRTHDATE',
         'gender': 'GENDER',
         'farmer': 'FARMER',
@@ -251,7 +254,6 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
             
             df_m.columns = [c.strip().lower() for c in df_m.columns]
             
-            # Ensure Key ID exists (rsbsa_no)
             if 'rsbsa_no' not in df_m.columns:
                 print("❌ Error: Column 'rsbsa_no' not found in Masterlist.")
                 return
@@ -266,13 +268,12 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
             if parcel_path.lower().endswith('.csv'): df_p = pd.read_csv(parcel_path)
             else: df_p = pd.read_excel(parcel_path)
             
-            # Create a Case-Insensitive Lookup for Parcel Columns
+            # Map for case-insensitive lookup
             p_cols_map = {c.strip().lower(): c for c in df_p.columns} 
             
-            # Check for FFRS Key
-            target_key = INTEGRITY_MAP['rsbsa_no'].strip().lower()
+            target_key = 'ffrs system generated no.'
             if target_key not in p_cols_map:
-                print(f"❌ Error: Parcel Key '{INTEGRITY_MAP['rsbsa_no']}' not found in Parcel List.")
+                print(f"❌ Error: Parcel Key 'FFRS System Generated No.' not found.")
                 return
             
             actual_key_col = p_cols_map[target_key]
@@ -291,12 +292,10 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
             df_m.loc[dup_mask, 'CONFLICT_GROUP'] = 'STRICT-' + df_m.loc[dup_mask, 'KEY_ID']
 
             # B. FUZZY MATCHING
-            # Using mapped columns if they exist
             m_fname = 'first_name' if 'first_name' in df_m.columns else df_m.columns[1]
             m_lname = 'last_name' if 'last_name' in df_m.columns else df_m.columns[3]
             m_bday = 'birthday' if 'birthday' in df_m.columns else 'birthdate'
             
-            # Create Signature
             df_m['LOOSE_SIG'] = (
                 df_m[m_lname].fillna('').astype(str).str.strip().str.upper() + 
                 df_m[m_bday].astype(str)
@@ -321,7 +320,6 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
                             name2 = str(r2.get(m_fname,'')).strip().upper()
                             
                             if similar(name1, name2) > 0.85:
-                                # Gender Check
                                 if 'gender' in df_m.columns:
                                     s1 = str(r1.get('gender', '')).strip().upper()
                                     s2 = str(r2.get('gender', '')).strip().upper()
@@ -344,24 +342,19 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
             
             # MERGE
             df_merged = pd.merge(df_m_clean, df_p, on='KEY_ID', how='left', suffixes=('', '_PARCEL'))
-            
             df_merged['HAS_PARCEL'] = df_merged['HAS_MULTIPLE_LAND_HOLDINGS'].notna()
             
-            # --- STRICT INTEGRITY LOOP ---
             integrity_errors = []
-            
             mask_has_parcel = df_merged['HAS_PARCEL'] == True
             
             for idx, row in df_merged[mask_has_parcel].iterrows():
                 mismatches = []
                 
-                # Check each pair in your map
+                # Check ONLY the enabled keys in INTEGRITY_MAP (Birthday, Gender, Sector)
                 for m_col, p_col_name in INTEGRITY_MAP.items():
-                    
                     if m_col not in df_merged.columns: continue 
                     val_m = str(row[m_col]).strip().upper()
                     
-                    # Find Parcel Column
                     actual_p_col = p_cols_map.get(p_col_name.strip().lower())
                     if not actual_p_col: continue 
                     
@@ -372,7 +365,6 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
                     if target_p_col not in df_merged.columns: continue
                     val_p = str(row[target_p_col]).strip().upper()
                     
-                    # COMPARE
                     is_empty_m = val_m in ['NAN', 'NONE', '', 'NAT', 'NULL']
                     is_empty_p = val_p in ['NAN', 'NONE', '', 'NAT', 'NULL']
                     
@@ -386,7 +378,6 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
                         'tag': f"[Data Mismatch] {'; '.join(mismatches)}"
                     })
 
-            # Apply Integrity Errors
             if integrity_errors:
                 for err in integrity_errors:
                     idx = err['index']
@@ -406,21 +397,30 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
             
             all_errors = pd.concat([df_m_error, df_conflict_post], ignore_index=True)
             
-            # --- COLUMN UNIFORMITY LOGIC ---
-            # Drop the mapped Parcel columns (to remove redundancy)
-            cols_to_drop = []
-            for p_name in INTEGRITY_MAP.values():
-                lower_p = p_name.strip().lower()
-                if lower_p in p_cols_map:
-                    real_name = p_cols_map[lower_p]
-                    cols_to_drop.append(real_name)
-                    cols_to_drop.append(f"{real_name}_PARCEL")
+            # --- COLUMN CLEANUP STRATEGY ---
+            # 1. We identify the Parcel Columns that correspond to the "disabled" checks too (Names, Addresses)
+            #    because we want to DROP the Parcel version and keep the Masterlist version.
+            
+            # Full list of columns usually found in Parcel list that duplicate Masterlist info
+            cols_to_drop_targets = [
+                'FFRS System Generated No.', 'FIRST NAME', 'MIDDLE NAME', 'LAST NAME', 'EXT NAME',
+                'FARMER ADDRESS 1', 'FARMER ADDRESS 2', 'FARMER ADDRESS 3',
+                'BIRTHDATE', 'GENDER', 'FARMER', 'FARMWORKER', 'FISHERFOLK'
+            ]
+            
+            cols_to_remove = []
+            for target in cols_to_drop_targets:
+                lower_target = target.strip().lower()
+                if lower_target in p_cols_map:
+                    real_name = p_cols_map[lower_target]
+                    cols_to_remove.append(real_name)           # The original parcel column name
+                    cols_to_remove.append(f"{real_name}_PARCEL") # The suffixed version
             
             helpers = ['LOOSE_SIG', 'DATA_STATUS', 'ERROR_TAG', 'HAS_PARCEL', 'parcel_count_temp', 'CONFLICT_GROUP', 'KEY_ID']
-            cols_to_drop.extend(helpers)
+            cols_to_remove.extend(helpers)
             
-            # Keep clean columns
-            final_cols = [c for c in df_with.columns if c not in cols_to_drop]
+            # Keep clean columns (Masterlist columns + Unique Parcel columns)
+            final_cols = [c for c in df_with.columns if c not in cols_to_remove]
             
             # SORTING
             sort_keys = []
@@ -433,16 +433,22 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
                 df_no.sort_values(by=sort_keys, inplace=True)
                 
             if not all_errors.empty:
+                # Ensure error keys exist
                 err_keys = ['CONFLICT_GROUP'] + [k for k in sort_keys if k in all_errors.columns]
                 all_errors.sort_values(by=err_keys, inplace=True)
 
             # SAVE
             with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+                # Sheet 1: With Parcels
                 df_with[final_cols].to_excel(writer, sheet_name='Clean - With Parcels', index=False)
                 
+                # Sheet 2: No Parcels
                 cols_no_parcels = [c for c in final_cols if c in df_m.columns]
                 df_no[cols_no_parcels].to_excel(writer, sheet_name='Clean - No Parcels', index=False)
                 
+                # Sheet 3: Errors
+                # For errors, we SHOW the removed parcel columns so user can see what happened
+                # (e.g., they can visually check if the addresses were actually different)
                 err_display_cols = ['CONFLICT_GROUP', 'ERROR_TAG'] + [c for c in all_errors.columns if c not in helpers]
                 all_errors[err_display_cols].to_excel(writer, sheet_name='Erroneous & Conflicts', index=False)
                 
@@ -454,7 +460,7 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
 
         print(f"🎉 Processed: {output_filename}")
         if integrity_errors:
-            print(f"   ⚠️ Found {len(integrity_errors)} Data Mismatches (Addresses Ignored).")
+            print(f"   ⚠️ Found {len(integrity_errors)} Data Mismatches (Strict Bio-data).")
 
     except Exception as e:
         print(f"❌ Error: {e}")
@@ -634,144 +640,216 @@ def run_regional_consolidation(input_dir, output_dir):
 
 def run_regional_analytics_mode4(input_dir, output_dir):
     """
-    MODE 4: REGIONAL DASHBOARD GENERATOR
-    Analyzes the 3 outputs from Mode 3:
-      1. Regional_With_Parcels.xlsx
-      2. Regional_No_Parcels.xlsx
-      3. Regional_Erroneous.xlsx
+    MODE 4: FARMERS REGISTRY GENERATOR (Clean & Erroneous)
     
-    Generates: 'Regional_Analytics_Dashboard.xlsx'
+    Output 1: 'Farmers Registry {Date}.xlsx' (Clean Summary)
+      - Matches legacy format (Mun/Bgy level demographics).
+      
+    Output 2: 'Farmers Registry Erroneous {Date}.xlsx' (Error Summary)
+      - Counts errors per Barangay (Duplicates, Conflicts, Mismatches).
     """
+    print("\n--- Starting Farmers Registry Generation (Mode 4) ---")
     
-    print("\n--- Starting Regional Analytics (Mode 4) ---")
+    # 1. Ask for Date
+    as_of_date = input("Enter 'As Of' Date (e.g. Sept 30, 2025): ").strip()
+    if not as_of_date: as_of_date = datetime.now().strftime("%b %d, %Y")
     
-    # Expected Inputs (Must match Mode 3 outputs)
-    files = {
-        'PARCEL': 'Regional_With_Parcels.xlsx',
-        'NO_PARCEL': 'Regional_No_Parcels.xlsx',
-        'ERROR': 'Regional_Erroneous.xlsx'
+    safe_date = "".join([c for c in as_of_date if c.isalnum() or c in (' ', '-', '_')]).strip()
+    
+    # --- PART A: CLEAN REGISTRY GENERATION ---
+    print("\n🔹 Generating Clean Registry...")
+    
+    clean_files = {
+        'clean_with': 'Regional_With_Parcels.xlsx',
+        'clean_no':   'Regional_No_Parcels.xlsx'
     }
     
-    # Check if files exist in the target directory
-    for key, fname in files.items():
-        f_path = os.path.join(input_dir, fname)
-        if not os.path.exists(f_path):
-            print(f"❌ Critical Error: Missing '{fname}'")
-            print(f"   Ensure you have run Mode 3 and selected the correct folder (Input/Output).")
-            return
+    df_clean = pd.DataFrame()
+    with LoadingSpinner("Loading Clean Data..."):
+        for f_key, fname in clean_files.items():
+            f_path = os.path.join(input_dir, fname)
+            if os.path.exists(f_path):
+                try:
+                    xls = pd.ExcelFile(f_path)
+                    for sheet in xls.sheet_names:
+                        df_part = pd.read_excel(xls, sheet_name=sheet)
+                        df_part['PROVINCE_SHEET'] = sheet
+                        df_clean = pd.concat([df_clean, df_part], ignore_index=True)
+                except: pass
 
-    # Initialize Stats Storage
-    stats = {p: {
-        'Farmers_With_Land': 0, 'Farmers_No_Land': 0, 'Erroneous_Entries': 0,
-        'Rice_Area_Ha': 0.0, 'Corn_Area_Ha': 0.0, 'Sugar_Area_Ha': 0.0, 'Total_Land_Ha': 0.0,
-        'Male': 0, 'Female': 0, 'Youth_12_30': 0, 'Senior_60_Up': 0
-    } for p in REQUIRED_PROVINCES}
-
-    try:
-        # --- PHASE 1: ANALYZE FARMERS WITH PARCELS ---
-        path_p = os.path.join(input_dir, files['PARCEL'])
-        with LoadingSpinner("Analyzing Land Data..."):
-            xls = pd.ExcelFile(path_p)
-            for prov in REQUIRED_PROVINCES:
-                if prov in xls.sheet_names:
-                    df = pd.read_excel(xls, sheet_name=prov)
-                    
-                    stats[prov]['Farmers_With_Land'] = len(df)
-                    stats[prov]['Rice_Area_Ha'] = df['AREA_RICE_HA'].sum()
-                    stats[prov]['Corn_Area_Ha'] = df['AREA_CORN_HA'].sum()
-                    stats[prov]['Sugar_Area_Ha'] = df['AREA_SUGAR_HA'].sum()
-                    stats[prov]['Total_Land_Ha'] = df['TOTAL_PARCEL_AREA_HA'].sum()
-                    
-                    # Demographics (Sex)
-                    col_sex = next((c for c in df.columns if 'sex' in c.lower() or 'gender' in c.lower()), None)
-                    if col_sex:
-                        s_counts = df[col_sex].astype(str).str.upper().value_counts()
-                        stats[prov]['Male'] += s_counts.get('MALE', 0) + s_counts.get('M', 0)
-                        stats[prov]['Female'] += s_counts.get('FEMALE', 0) + s_counts.get('F', 0)
-                    
-                    # Demographics (Age)
-                    col_bday = next((c for c in df.columns if 'birth' in c.lower()), None)
-                    if col_bday:
-                        df[col_bday] = pd.to_datetime(df[col_bday], errors='coerce')
-                        now = datetime.now()
-                        df['AGE'] = (now - df[col_bday]).dt.days // 365
-                        stats[prov]['Youth_12_30'] += len(df[(df['AGE'] >= 12) & (df['AGE'] <= 30)])
-                        stats[prov]['Senior_60_Up'] += len(df[df['AGE'] >= 60])
-
-        # --- PHASE 2: ANALYZE FARMERS NO PARCELS ---
-        path_np = os.path.join(input_dir, files['NO_PARCEL'])
-        with LoadingSpinner("Analyzing Farmers w/o Land..."):
-            xls = pd.ExcelFile(path_np)
-            for prov in REQUIRED_PROVINCES:
-                if prov in xls.sheet_names:
-                    df = pd.read_excel(xls, sheet_name=prov)
-                    stats[prov]['Farmers_No_Land'] = len(df)
-                    
-                    # Add to demographics
-                    col_sex = next((c for c in df.columns if 'sex' in c.lower() or 'gender' in c.lower()), None)
-                    if col_sex:
-                        s_counts = df[col_sex].astype(str).str.upper().value_counts()
-                        stats[prov]['Male'] += s_counts.get('MALE', 0) + s_counts.get('M', 0)
-                        stats[prov]['Female'] += s_counts.get('FEMALE', 0) + s_counts.get('F', 0)
-                        
-                    col_bday = next((c for c in df.columns if 'birth' in c.lower()), None)
-                    if col_bday:
-                        df[col_bday] = pd.to_datetime(df[col_bday], errors='coerce')
-                        now = datetime.now()
-                        df['AGE'] = (now - df[col_bday]).dt.days // 365
-                        stats[prov]['Youth_12_30'] += len(df[(df['AGE'] >= 12) & (df['AGE'] <= 30)])
-                        stats[prov]['Senior_60_Up'] += len(df[df['AGE'] >= 60])
-
-        # --- PHASE 3: ANALYZE ERRORS ---
-        path_err = os.path.join(input_dir, files['ERROR'])
-        with LoadingSpinner("Analyzing Error Logs..."):
-            xls = pd.ExcelFile(path_err)
-            for prov in REQUIRED_PROVINCES:
-                if prov in xls.sheet_names:
-                    df = pd.read_excel(xls, sheet_name=prov)
-                    stats[prov]['Erroneous_Entries'] = len(df)
-
-        # --- PHASE 4: COMPILE & SAVE REPORT ---
-        output_filename = f"Regional_Analytics_Dashboard_{datetime.now().strftime('%Y%m%d')}.xlsx"
-        output_path = os.path.join(output_dir, output_filename)
-        
-        with LoadingSpinner("Generating Dashboard..."):
-            # Convert Dict to DataFrame
-            df_stats = pd.DataFrame.from_dict(stats, orient='index')
-            df_stats.index.name = 'PROVINCE'
-            df_stats.reset_index(inplace=True)
+    if not df_clean.empty:
+        with LoadingSpinner("Aggregating Clean Data..."):
+            df_clean.columns = [c.strip().lower() for c in df_clean.columns]
             
-            # Add Totals Row
-            sum_row = df_stats.sum(numeric_only=True)
-            sum_row['PROVINCE'] = 'REGION 6 TOTAL'
-            df_stats = pd.concat([df_stats, pd.DataFrame([sum_row])], ignore_index=True)
+            # Column Mapping
+            col_mun = next((c for c in df_clean.columns if 'mun' in c and 'address' in c), 'farmer_address_mun')
+            col_bgy = next((c for c in df_clean.columns if 'bgy' in c and 'address' in c), 'farmer_address_bgy')
+            col_id  = next((c for c in df_clean.columns if 'rsbsa' in c and 'no' in c), 'rsbsa_no')
+            col_sex = next((c for c in df_clean.columns if 'sex' in c or 'gender' in c), None)
+            col_bday = next((c for c in df_clean.columns if 'birth' in c), None)
+            col_farmer = next((c for c in df_clean.columns if 'farmer' == c), None)
+            col_worker = next((c for c in df_clean.columns if 'farmworker' in c), None)
+            col_fisher = next((c for c in df_clean.columns if 'fisher' in c), None)
+            col_agency = next((c for c in df_clean.columns if 'agency' in c), None)
 
-            with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
-                df_stats.to_excel(writer, sheet_name='Executive Summary', index=False)
+            # Age Calc
+            if col_bday:
+                df_clean[col_bday] = pd.to_datetime(df_clean[col_bday], errors='coerce')
+                df_clean['AGE'] = (datetime.now() - df_clean[col_bday]).dt.days // 365
+            else:
+                df_clean['AGE'] = 0
+
+            # Deduplicate for Head Count
+            df_unique = df_clean.drop_duplicates(subset=[col_id])
+            
+            clean_outputs = {} # {PROVINCE: DataFrame}
+            
+            for prov in df_unique['PROVINCE_SHEET'].unique():
+                prov_df = df_unique[df_unique['PROVINCE_SHEET'] == prov]
+                rows = []
                 
+                # Group by Mun/Bgy
+                for (mun, bgy), group in prov_df.groupby([col_mun, col_bgy]):
+                    # Counts
+                    n_farmers = group[col_farmer].astype(str).str.upper().apply(lambda x: 1 if 'YES' in x or 'TRUE' in x else 0).sum() if col_farmer else 0
+                    n_workers = group[col_worker].astype(str).str.upper().apply(lambda x: 1 if 'YES' in x or 'TRUE' in x else 0).sum() if col_worker else 0
+                    n_fisher = group[col_fisher].astype(str).str.upper().apply(lambda x: 1 if 'YES' in x or 'TRUE' in x else 0).sum() if col_fisher else 0
+                    
+                    # Distinct Agencies
+                    n_agencies = 0
+                    if col_agency:
+                        agencies = group[col_agency].dropna().astype(str).tolist()
+                        unique_set = set()
+                        for a in agencies:
+                            for p in a.split(','): 
+                                clean_a = p.strip().upper()
+                                if clean_a and clean_a not in ['NAN', 'NONE', '']: unique_set.add(clean_a)
+                        n_agencies = len(unique_set)
+
+                    # Demographics
+                    n_male = 0; n_female = 0
+                    if col_sex:
+                        n_male = len(group[group[col_sex].astype(str).str.upper().isin(['M', 'MALE'])])
+                        n_female = len(group[group[col_sex].astype(str).str.upper().isin(['F', 'FEMALE'])])
+                    
+                    n_youth = len(group[group['AGE'].between(12, 30)])
+                    n_working = len(group[group['AGE'].between(31, 59)])
+                    n_senior = len(group[group['AGE'] >= 60])
+                    
+                    rows.append({
+                        'Municipality': mun, 'Barangay': bgy,
+                        'Farmers': n_farmers, 'Farmworkers': n_workers, 'Fisherfolk': n_fisher,
+                        'Distinct Agencies': n_agencies,
+                        'Male': n_male, 'Female': n_female,
+                        'Youth (12-30)': n_youth, 'Working Age (31-59)': n_working, 'Senior (60+)': n_senior
+                    })
+                
+                if rows:
+                    df_res = pd.DataFrame(rows).sort_values(by=['Municipality', 'Barangay'])
+                    clean_outputs[prov] = df_res
+
+        # Save Clean Registry
+        clean_file = f"Farmers Registry {safe_date}.xlsx"
+        try:
+            with pd.ExcelWriter(os.path.join(output_dir, clean_file), engine='xlsxwriter') as writer:
                 wb = writer.book
-                ws = writer.sheets['Executive Summary']
+                title_fmt = wb.add_format({'bold': True, 'font_size': 14})
+                sub_fmt = wb.add_format({'italic': True})
+                header_fmt = wb.add_format({'bold': True, 'bg_color': '#D9E1F2', 'border': 1, 'align': 'center'})
                 
-                # Formats
-                fmt_header = wb.add_format({'bold': True, 'align': 'center', 'bg_color': '#D9E1F2', 'border': 1})
-                fmt_num = wb.add_format({'num_format': '#,##0', 'border': 1})
-                fmt_dec = wb.add_format({'num_format': '#,##0.00', 'border': 1})
-                fmt_total = wb.add_format({'bold': True, 'bg_color': '#FFFFCC', 'border': 1, 'num_format': '#,##0'})
-                
-                # Apply Formats
-                ws.set_column(0, 0, 20) # Province col
-                ws.set_column(1, 3, 15, fmt_num) # Counts
-                ws.set_column(4, 7, 18, fmt_dec) # Areas
-                ws.set_column(8, 11, 12, fmt_num) # Demographics
-                
-                # Highlight Total Row
-                last_row = len(df_stats)
-                ws.set_row(last_row, None, fmt_total)
+                for prov, df in clean_outputs.items():
+                    df.to_excel(writer, sheet_name=prov, startrow=5, index=False)
+                    ws = writer.sheets[prov]
+                    ws.write(0, 0, f"RSBSA Summary Report - {prov}", title_fmt)
+                    ws.write(1, 0, f"\"As of: {as_of_date}\"", sub_fmt)
+                    ws.write(2, 0, "Age Legend: Youth (12-30) | Working Age (31-59) | Senior (60+)", sub_fmt)
+                    ws.set_column(0, 1, 25)
+                    ws.set_column(2, 10, 15)
+                    for i, val in enumerate(df.columns): ws.write(5, i, val, header_fmt)
+            print(f"   ✅ Created: {clean_file}")
+        except Exception as e:
+            print(f"   ❌ Error creating clean registry: {e}")
+    else:
+        print("   ⚠️ No Clean Data found.")
 
-        print(f"\n📊 Analytics Generated: {output_filename}")
+    # --- PART B: ERRONEOUS REGISTRY GENERATION ---
+    print("\n🔹 Generating Erroneous Registry...")
+    
+    error_file_path = os.path.join(input_dir, 'Regional_Erroneous.xlsx')
+    df_err = pd.DataFrame()
+    
+    with LoadingSpinner("Loading Erroneous Data..."):
+        if os.path.exists(error_file_path):
+            try:
+                xls = pd.ExcelFile(error_file_path)
+                for sheet in xls.sheet_names:
+                    df_part = pd.read_excel(xls, sheet_name=sheet)
+                    df_part['PROVINCE_SHEET'] = sheet
+                    df_err = pd.concat([df_err, df_part], ignore_index=True)
+            except: pass
 
-    except Exception as e:
-        print(f"❌ Error Generating Analytics: {e}")
+    if not df_err.empty:
+        with LoadingSpinner("Aggregating Errors..."):
+            df_err.columns = [c.strip().lower() for c in df_err.columns]
+            
+            # Map columns
+            col_mun = next((c for c in df_err.columns if 'mun' in c and 'address' in c), 'farmer_address_mun')
+            col_bgy = next((c for c in df_err.columns if 'bgy' in c and 'address' in c), 'farmer_address_bgy')
+            col_tag = next((c for c in df_err.columns if 'tag' in c), 'error_tag')
+            
+            err_outputs = {}
+            
+            for prov in df_err['PROVINCE_SHEET'].unique():
+                prov_df = df_err[df_err['PROVINCE_SHEET'] == prov]
+                rows = []
+                
+                # Group by Mun/Bgy
+                # Note: Some errors might have missing Mun/Bgy if the data is very bad
+                # We fillNA to 'UNKNOWN'
+                prov_df[col_mun] = prov_df[col_mun].fillna('UNKNOWN')
+                prov_df[col_bgy] = prov_df[col_bgy].fillna('UNKNOWN')
+                
+                for (mun, bgy), group in prov_df.groupby([col_mun, col_bgy]):
+                    total_err = len(group)
+                    # Simple keyword counting in the Error Tag
+                    n_strict = group[col_tag].astype(str).apply(lambda x: 1 if 'Duplicate' in x else 0).sum()
+                    n_fuzzy = group[col_tag].astype(str).apply(lambda x: 1 if 'Identity' in x else 0).sum()
+                    n_mismatch = group[col_tag].astype(str).apply(lambda x: 1 if 'Mismatch' in x else 0).sum()
+                    
+                    rows.append({
+                        'Municipality': mun, 'Barangay': bgy,
+                        'Total Errors': total_err,
+                        'Strict Duplicates': n_strict,
+                        'Identity Conflicts': n_fuzzy,
+                        'Data Mismatches': n_mismatch
+                    })
+                
+                if rows:
+                    df_res = pd.DataFrame(rows).sort_values(by=['Municipality', 'Barangay'])
+                    err_outputs[prov] = df_res
+
+        # Save Erroneous Registry
+        err_out_file = f"Farmers Registry Erroneous {safe_date}.xlsx"
+        try:
+            with pd.ExcelWriter(os.path.join(output_dir, err_out_file), engine='xlsxwriter') as writer:
+                wb = writer.book
+                title_fmt = wb.add_format({'bold': True, 'font_size': 14, 'font_color': '#9C0006'})
+                header_fmt = wb.add_format({'bold': True, 'bg_color': '#FFC7CE', 'border': 1, 'align': 'center', 'font_color': '#9C0006'})
+                
+                for prov, df in err_outputs.items():
+                    df.to_excel(writer, sheet_name=prov, startrow=4, index=False)
+                    ws = writer.sheets[prov]
+                    ws.write(0, 0, f"Erroneous Summary Report - {prov}", title_fmt)
+                    ws.write(1, 0, f"\"As of: {as_of_date}\"", wb.add_format({'italic': True}))
+                    ws.set_column(0, 1, 25)
+                    ws.set_column(2, 5, 18)
+                    for i, val in enumerate(df.columns): ws.write(4, i, val, header_fmt)
+            print(f"   ✅ Created: {err_out_file}")
+        except Exception as e:
+            print(f"   ❌ Error creating erroneous registry: {e}")
+            
+    else:
+        print("   ⚠️ No Erroneous Data found.")
 
 # --- MODE 5: GEOTAG PROCESSOR (Renamed from 4) ---
 
