@@ -310,8 +310,25 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
                             # Check similarity (Threshold 0.85 allows for 'MARIA' vs 'MA.')
                             ratio = similar(name1, name2)
                             if ratio > 0.85:
-                                fuzzy_matches.append(r1)
-                                fuzzy_matches.append(r2)
+                                r1_copy = r1.copy()
+                                r2_copy = r2.copy()
+                                
+                                # Construct Reason
+                                reason = "Same Name + Birthday"
+                                # Check Municipality
+                                if str(r1.get(m_mun,'')).strip().upper() == str(r2.get(m_mun,'')).strip().upper():
+                                    reason += " + Same Municipality"
+                                # Check Exact Name
+                                if name1 == name2:
+                                    reason += " + Exact Name Match"
+                                else:
+                                    reason += f" + Fuzzy Name Match ({int(ratio*100)}%)"
+                                
+                                r1_copy['REASON'] = reason
+                                r2_copy['REASON'] = reason
+                                
+                                fuzzy_matches.append(r1_copy)
+                                fuzzy_matches.append(r2_copy)
             
             if fuzzy_matches:
                 df_identity_conflicts = pd.DataFrame(fuzzy_matches).drop_duplicates(subset=['KEY_ID'])
@@ -324,7 +341,8 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
 
             # C. Parcel Deduplication
             len_before = len(df_p)
-            df_p_deduped = df_p.drop_duplicates() 
+            # FIX: Use .copy() to avoid SettingWithCopyWarning later
+            df_p_deduped = df_p.drop_duplicates().copy() 
             duplicates_removed_count = len_before - len(df_p_deduped)
 
         # 4. AGGREGATE PARCELS
@@ -398,7 +416,12 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
                     df_unmatched.to_excel(writer, sheet_name='Farmers No Parcel', index=False)
 
                 if not df_identity_conflicts.empty:
+                    # Rearrange columns to show REASON first if possible or near name
                     cols = [c for c in df_identity_conflicts.columns if c not in ['LOOSE_SIG', 'KEY_ID']]
+                    # Ensure REASON is included
+                    if 'REASON' in df_identity_conflicts.columns:
+                         # Put REASON at the start or end? Let's put it at the end for context
+                         pass
                     df_identity_conflicts[cols].to_excel(writer, sheet_name='Identity Conflicts (Fuzzy)', index=False)
                 
                 if not df_id_duplicates.empty:
