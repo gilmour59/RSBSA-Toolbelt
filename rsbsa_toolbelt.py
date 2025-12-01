@@ -210,16 +210,14 @@ def calculate_polygon_area(lats, lons):
 
 def process_masterlist_merger(master_path, parcel_path, output_dir):
     """
-    MODE 2: TRIAGE SYSTEM (Granular - One Row Per Parcel)
+    MODE 2: TRIAGE SYSTEM (Cluster Sorted)
     
-    Logic:
-    1. Identify Clean vs Erroneous Farmers in Masterlist.
-    2. JOIN Clean Farmers with Parcel List (One-to-Many).
-    3. Calculate 'HAS_MULTIPLE_LAND_HOLDINGS'.
-    4. Separate into 'With Parcels', 'No Parcels', 'Erroneous'.
+    Improvements:
+    1. Gender Check: Prevents False Positives (Male vs Female).
+    2. Conflict Grouping: Assigns a unique Group ID to conflicting pairs.
+    3. Neighbor Sorting: Sorts Erroneous sheet so conflicts appear side-by-side.
     """
     
-    # Naming: {MasterlistName}-merged.xlsx
     base_name = os.path.splitext(os.path.basename(master_path))[0]
     output_filename = f"{base_name}-merged.xlsx"
     output_path = os.path.join(output_dir, output_filename)
@@ -243,117 +241,125 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
             df_m['KEY_ID'] = df_m[col_rsbsa].astype(str).str.strip().str.upper()
             df_m['DATA_STATUS'] = 'CLEAN' 
             df_m['ERROR_TAG'] = ''   
+            df_m['CONFLICT_GROUP'] = '' # New column for sorting neighbors
 
         # --- 2. LOAD PARCEL LIST ---
         with LoadingSpinner("Loading Parcel List..."):
             if parcel_path.lower().endswith('.csv'): df_p = pd.read_csv(parcel_path)
             else: df_p = pd.read_excel(parcel_path)
             
-            # Preserve original column names for output, but lower them for searching
             original_p_cols = list(df_p.columns)
             df_p.columns = [c.strip().lower() for c in df_p.columns]
             
-            # Find Key Columns
             col_ffrs = next((c for c in df_p.columns if 'ffrs' in c or 'system generated' in c), None)
-            
             if not col_ffrs:
                 print("❌ Error: FFRS ID column not found in Parcel List.")
                 return
             
-            # Create Key
             df_p['KEY_ID'] = df_p[col_ffrs].astype(str).str.strip().str.upper()
             
-            # FLAG MULTIPLE HOLDINGS (New Feature)
-            # Count how many times each ID appears in the parcel list
+            # Flag Multiple Holdings
             df_p['parcel_count_temp'] = df_p.groupby('KEY_ID')['KEY_ID'].transform('count')
             df_p['HAS_MULTIPLE_LAND_HOLDINGS'] = df_p['parcel_count_temp'].apply(lambda x: 'YES' if x > 1 else 'NO')
             
-            # Restore original column names (mapped) so output looks nice
-            # We map the lowercase cols back to original, but keep KEY_ID and HAS_MULTIPLE...
+            # Restore Parcel Columns
             col_map = {c.strip().lower(): c for c in original_p_cols}
-            
-            # We need to drop the temporary lowercased columns and keep the calculated ones + Original content
-            # Strategy: Rename the current lowercased columns back to Title Case
             df_p = df_p.rename(columns=col_map)
 
-        # --- 3. FLAGGING ERRORS (TRIAGE) ---
-        with LoadingSpinner("Triaging: Detecting Duplicates & Conflicts..."):
+        # --- 3. FLAGGING ERRORS (THE CLUSTER LOGIC) ---
+        with LoadingSpinner("Triaging: Grouping Conflicts..."):
             
-            # A. STRICT DUPLICATE IDs (Masterlist side)
-            dup_mask = df_m.duplicated(subset=['KEY_ID'], keep=False)
-            df_m.loc[dup_mask, 'DATA_STATUS'] = 'ERROR'
-            df_m.loc[dup_mask, 'ERROR_TAG'] += '[Duplicate RSBSA ID] '
-
-            # B. FUZZY IDENTITY CONFLICTS
+            # Identify columns for Fuzzy Match
             m_fname = next((c for c in df_m.columns if 'first' in c and 'name' in c), 'first_name')
             m_lname = next((c for c in df_m.columns if 'last' in c and 'name' in c), 'last_name')
             m_bday = next((c for c in df_m.columns if 'birth' in c), 'birthday')
+            m_sex  = next((c for c in df_m.columns if 'sex' in c or 'gender' in c), None) # Gender Check
 
+            # A. STRICT DUPLICATE IDs
+            # We assign a Conflict Group based on the ID itself. 
+            # All rows with ID '123' get Group 'STRICT-123'
+            dup_mask = df_m.duplicated(subset=['KEY_ID'], keep=False)
+            df_m.loc[dup_mask, 'DATA_STATUS'] = 'ERROR'
+            df_m.loc[dup_mask, 'ERROR_TAG'] += '[Duplicate RSBSA ID] '
+            df_m.loc[dup_mask, 'CONFLICT_GROUP'] = 'STRICT-' + df_m.loc[dup_mask, 'KEY_ID']
+
+            # B. FUZZY IDENTITY CONFLICTS
+            # Only check rows that aren't already strict duplicates
             df_m['LOOSE_SIG'] = (
                 df_m[m_lname].fillna('').astype(str).str.strip().str.upper() + 
                 df_m[m_bday].astype(str)
             )
             
-            potential_dupes = df_m[df_m.duplicated(subset=['LOOSE_SIG'], keep=False)]
-            conflict_ids = set()
+            # Filter candidates (Same Last Name + Bday)
+            candidates = df_m[df_m['DATA_STATUS'] == 'CLEAN'].copy()
+            potential_dupes = candidates[candidates.duplicated(subset=['LOOSE_SIG'], keep=False)]
             
+            fuzzy_counter = 1
+            conflict_updates = [] # Store (index, error_tag, group_id)
+
             if not potential_dupes.empty:
                 for sig, group in potential_dupes.groupby('LOOSE_SIG'):
                     if len(group) < 2: continue
-                    rows = group.to_dict('records')
+                    rows = group.to_dict('records') # Convert to list of dicts for iteration
+                    indices = group.index.tolist()
+                    
+                    # Compare every pair in this group
                     for i in range(len(rows)):
                         for j in range(i + 1, len(rows)):
                             r1, r2 = rows[i], rows[j]
-                            if r1['KEY_ID'] == r2['KEY_ID']: continue 
-                            name1 = f"{r1.get(m_fname,'')} {r1.get(m_lname,'')}".strip().upper()
-                            name2 = f"{r2.get(m_fname,'')} {r2.get(m_lname,'')}".strip().upper()
+                            idx1, idx2 = indices[i], indices[j]
+                            
+                            # 1. First Name Check (>85%)
+                            name1 = str(r1.get(m_fname,'')).strip().upper()
+                            name2 = str(r2.get(m_fname,'')).strip().upper()
+                            
                             if similar(name1, name2) > 0.85:
-                                conflict_ids.add(r1['KEY_ID'])
-                                conflict_ids.add(r2['KEY_ID'])
+                                # 2. GENDER CHECK (The New Filter)
+                                if m_sex:
+                                    s1 = str(r1.get(m_sex, '')).strip().upper()
+                                    s2 = str(r2.get(m_sex, '')).strip().upper()
+                                    # If both have data and are different (M vs F), skip (not a dupe)
+                                    if s1 and s2 and s1 != s2:
+                                        continue 
 
-            if conflict_ids:
-                is_conflict = df_m['KEY_ID'].isin(conflict_ids)
-                df_m.loc[is_conflict, 'DATA_STATUS'] = 'ERROR'
-                df_m.loc[is_conflict, 'ERROR_TAG'] += '[Identity Conflict] '
+                                # If we get here, it's a Fuzzy Match
+                                group_id = f"FUZZY-{fuzzy_counter:04d}"
+                                conflict_updates.append((idx1, '[Identity Conflict]', group_id))
+                                conflict_updates.append((idx2, '[Identity Conflict]', group_id))
+                                fuzzy_counter += 1
+
+            # Apply Fuzzy Updates
+            for idx, tag, grp in conflict_updates:
+                df_m.at[idx, 'DATA_STATUS'] = 'ERROR'
+                # Append tag if not present
+                curr_tag = str(df_m.at[idx, 'ERROR_TAG'])
+                if tag not in curr_tag:
+                    df_m.at[idx, 'ERROR_TAG'] = curr_tag + tag + " "
+                # Assign Group (Overwrite is fine, means they belong to the latest cluster)
+                df_m.at[idx, 'CONFLICT_GROUP'] = grp
 
         # --- 4. MERGING (ONE-TO-MANY) ---
         with LoadingSpinner("Merging Masterlist with Parcels..."):
             
-            # Split Masterlist into Clean and Error
             df_m_clean = df_m[df_m['DATA_STATUS'] == 'CLEAN'].copy()
             df_m_error = df_m[df_m['DATA_STATUS'] == 'ERROR'].copy()
             
-            # MERGE STEP: Left Join Clean Farmers -> Parcel List
-            # This preserves multiple rows for the same farmer
+            # Merge Clean
             df_merged = pd.merge(df_m_clean, df_p, on='KEY_ID', how='left')
-            
-            # Determine status based on merge
-            # If a column from df_p is NaN, it means they have no parcel
-            # We pick a column we know exists in df_p to check, e.g., 'HAS_MULTIPLE_LAND_HOLDINGS'
             df_merged['HAS_PARCEL'] = df_merged['HAS_MULTIPLE_LAND_HOLDINGS'].notna()
-            
-            # Fill NaN for farmers with no parcels
             df_merged['HAS_MULTIPLE_LAND_HOLDINGS'] = df_merged['HAS_MULTIPLE_LAND_HOLDINGS'].fillna('NO')
 
         # --- 5. SPLIT, SORT & SAVE ---
         with LoadingSpinner("Splitting and Sorting..."):
             
-            # Split into the 3 buckets
             df_with = df_merged[df_merged['HAS_PARCEL'] == True].copy()
             df_no = df_merged[df_merged['HAS_PARCEL'] == False].copy()
             
-            # Clean up columns (Remove helper cols)
-            drop_cols = ['LOOSE_SIG', 'DATA_STATUS', 'ERROR_TAG', 'HAS_PARCEL', 'parcel_count_temp']
+            # Cleanup
+            drop_cols = ['LOOSE_SIG', 'DATA_STATUS', 'ERROR_TAG', 'HAS_PARCEL', 'parcel_count_temp', 'CONFLICT_GROUP']
             final_cols_with = [c for c in df_with.columns if c not in drop_cols]
-            final_cols_no = [c for c in df_no.columns if c not in drop_cols and c not in df_p.columns] # Remove parcel cols from 'No Parcel' sheet
             
-            # Re-attach the basic Masterlist columns for the "No Parcel" sheet if they got dropped
-            # Actually, the merge keeps them. We just want to ensure we don't show empty Parcel columns for "No Parcel" guys.
-            # Strategy: Keep only Masterlist columns for df_no
-            df_no = df_no[[c for c in df_m.columns if c not in ['LOOSE_SIG', 'DATA_STATUS', 'ERROR_TAG']]]
-            
-            # --- SORTING LOGIC ---
-            # Municipality -> Barangay -> Last Name -> (New) Parcel Address/Commodity
+            # Standard Sorting for Clean Data
             sort_keys = []
             m_mun = next((c for c in df_with.columns if 'mun' in c.lower() and 'address' in c.lower()), None)
             m_bgy = next((c for c in df_with.columns if 'bgy' in c.lower() and 'address' in c.lower()), None)
@@ -364,32 +370,34 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
             if m_last: sort_keys.append(m_last)
             
             if sort_keys:
-                print(f"   Sorting by: {' -> '.join(sort_keys)}")
                 df_with.sort_values(by=sort_keys, inplace=True)
                 df_no.sort_values(by=sort_keys, inplace=True)
-                if 'ERROR_TAG' in df_m_error.columns:
-                     # For errors, we need to ensure the sort keys exist (they are from masterlist)
-                     err_sort = ['ERROR_TAG'] + [k for k in sort_keys if k in df_m_error.columns]
-                     df_m_error.sort_values(by=err_sort, inplace=True)
+
+            # --- SORTING FOR ERRORS (NEIGHBOR CLUSTERING) ---
+            # We sort primarily by 'CONFLICT_GROUP' so matching rows stay together
+            if not df_m_error.empty:
+                df_m_error.sort_values(by=['CONFLICT_GROUP', m_last], inplace=True)
 
             # SAVE
             with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
                 df_with.to_excel(writer, sheet_name='Clean - With Parcels', index=False)
-                df_no.to_excel(writer, sheet_name='Clean - No Parcels', index=False)
+                df_no[[c for c in df_m.columns if c not in drop_cols]].to_excel(writer, sheet_name='Clean - No Parcels', index=False)
                 
-                # For Error Sheet, we only have Masterlist data (no merge done on errors)
-                # But we might want to see if those errors *had* parcels. 
-                # For now, following strict logic: Errors are quarantined before merging.
-                df_m_error.to_excel(writer, sheet_name='Erroneous & Conflicts', index=False)
+                # Save Errors with the Conflict Group visible so user knows why they are neighbors
+                err_cols = ['CONFLICT_GROUP', 'ERROR_TAG'] + [c for c in df_m.columns if c not in ['CONFLICT_GROUP', 'ERROR_TAG', 'LOOSE_SIG', 'DATA_STATUS']]
+                df_m_error[err_cols].to_excel(writer, sheet_name='Erroneous & Conflicts', index=False)
                 
-                # Formatting
+                # Format Errors
                 wb = writer.book
                 ws_err = writer.sheets['Erroneous & Conflicts']
                 red_fmt = wb.add_format({'font_color': '#9C0006', 'bg_color': '#FFC7CE'})
-                ws_err.conditional_format(1, 0, len(df_m_error), 0, {'type': 'no_blanks', 'format': red_fmt})
+                
+                # Highlight the Group ID and Tag
+                ws_err.conditional_format(1, 0, len(df_m_error), 1, {'type': 'no_blanks', 'format': red_fmt})
+                ws_err.set_column(0, 1, 25) # Widen columns
 
         print(f"🎉 Processed: {output_filename}")
-        print(f"   (Granular Format: Multiple rows per farmer preserved)")
+        print(f"   (Errors Sorted by Conflict Neighbor)")
 
     except Exception as e:
         print(f"❌ Error: {e}")
