@@ -210,12 +210,11 @@ def calculate_polygon_area(lats, lons):
 
 def process_masterlist_merger(master_path, parcel_path, output_dir):
     """
-    MODE 2: TRIAGE SYSTEM (Cluster Sorted)
+    MODE 2: TRIAGE SYSTEM (Strict Mapping & Granular)
     
-    Improvements:
-    1. Gender Check: Prevents False Positives (Male vs Female).
-    2. Conflict Grouping: Assigns a unique Group ID to conflicting pairs.
-    3. Neighbor Sorting: Sorts Erroneous sheet so conflicts appear side-by-side.
+    Updates:
+    - Removed Address Validation (Prevents false positives).
+    - Keeps Masterlist Address as the official address.
     """
     
     base_name = os.path.splitext(os.path.basename(master_path))[0]
@@ -224,6 +223,26 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
 
     print(f"\n--- Starting Triage Analysis for: {base_name} ---")
     
+    # --- DEFINING THE STRICT MAPPING ---
+    # Key = Masterlist Column (The "Truth")
+    # Value = Parcel List Column (The "Comparison Target")
+    # REMOVED: Addresses (to avoid false positives)
+    INTEGRITY_MAP = {
+        'rsbsa_no': 'FFRS System Generated No.',
+        'first_name': 'FIRST NAME',
+        'middle_name': 'MIDDLE NAME',
+        'last_name': 'LAST NAME',
+        'ext_name': 'EXT NAME',
+        # 'farmer_address_bgy': 'FARMER ADDRESS 1',  <-- DISABLED
+        # 'farmer_address_mun': 'FARMER ADDRESS 2',  <-- DISABLED
+        # 'farmer_address_prv': 'FARMER ADDRESS 3',  <-- DISABLED
+        'birthday': 'BIRTHDATE',
+        'gender': 'GENDER',
+        'farmer': 'FARMER',
+        'farmworker': 'FARMWORKER',
+        'fisherfolk': 'FISHERFOLK'
+    }
+
     try:
         # --- 1. LOAD MASTERLIST ---
         with LoadingSpinner("Loading Masterlist..."):
@@ -232,172 +251,210 @@ def process_masterlist_merger(master_path, parcel_path, output_dir):
             
             df_m.columns = [c.strip().lower() for c in df_m.columns]
             
-            # Find RSBSA ID
-            col_rsbsa = next((c for c in df_m.columns if 'rsbsa' in c and 'no' in c), None)
-            if not col_rsbsa:
-                print("❌ Error: RSBSA No. column not found.")
+            # Ensure Key ID exists (rsbsa_no)
+            if 'rsbsa_no' not in df_m.columns:
+                print("❌ Error: Column 'rsbsa_no' not found in Masterlist.")
                 return
             
-            df_m['KEY_ID'] = df_m[col_rsbsa].astype(str).str.strip().str.upper()
+            df_m['KEY_ID'] = df_m['rsbsa_no'].astype(str).str.strip().str.upper()
             df_m['DATA_STATUS'] = 'CLEAN' 
             df_m['ERROR_TAG'] = ''   
-            df_m['CONFLICT_GROUP'] = '' # New column for sorting neighbors
+            df_m['CONFLICT_GROUP'] = ''
 
         # --- 2. LOAD PARCEL LIST ---
         with LoadingSpinner("Loading Parcel List..."):
             if parcel_path.lower().endswith('.csv'): df_p = pd.read_csv(parcel_path)
             else: df_p = pd.read_excel(parcel_path)
             
-            original_p_cols = list(df_p.columns)
-            df_p.columns = [c.strip().lower() for c in df_p.columns]
+            # Create a Case-Insensitive Lookup for Parcel Columns
+            p_cols_map = {c.strip().lower(): c for c in df_p.columns} 
             
-            col_ffrs = next((c for c in df_p.columns if 'ffrs' in c or 'system generated' in c), None)
-            if not col_ffrs:
-                print("❌ Error: FFRS ID column not found in Parcel List.")
+            # Check for FFRS Key
+            target_key = INTEGRITY_MAP['rsbsa_no'].strip().lower()
+            if target_key not in p_cols_map:
+                print(f"❌ Error: Parcel Key '{INTEGRITY_MAP['rsbsa_no']}' not found in Parcel List.")
                 return
             
-            df_p['KEY_ID'] = df_p[col_ffrs].astype(str).str.strip().str.upper()
+            actual_key_col = p_cols_map[target_key]
+            df_p['KEY_ID'] = df_p[actual_key_col].astype(str).str.strip().str.upper()
             
             # Flag Multiple Holdings
             df_p['parcel_count_temp'] = df_p.groupby('KEY_ID')['KEY_ID'].transform('count')
             df_p['HAS_MULTIPLE_LAND_HOLDINGS'] = df_p['parcel_count_temp'].apply(lambda x: 'YES' if x > 1 else 'NO')
-            
-            # Restore Parcel Columns
-            col_map = {c.strip().lower(): c for c in original_p_cols}
-            df_p = df_p.rename(columns=col_map)
 
-        # --- 3. FLAGGING ERRORS (THE CLUSTER LOGIC) ---
-        with LoadingSpinner("Triaging: Grouping Conflicts..."):
-            
-            # Identify columns for Fuzzy Match
-            m_fname = next((c for c in df_m.columns if 'first' in c and 'name' in c), 'first_name')
-            m_lname = next((c for c in df_m.columns if 'last' in c and 'name' in c), 'last_name')
-            m_bday = next((c for c in df_m.columns if 'birth' in c), 'birthday')
-            m_sex  = next((c for c in df_m.columns if 'sex' in c or 'gender' in c), None) # Gender Check
-
-            # A. STRICT DUPLICATE IDs
-            # We assign a Conflict Group based on the ID itself. 
-            # All rows with ID '123' get Group 'STRICT-123'
+        # --- 3. PRE-MERGE TRIAGE (Duplicates & Fuzzy) ---
+        with LoadingSpinner("Triaging: Analyzing Masterlist..."):
+            # A. STRICT DUPLICATES
             dup_mask = df_m.duplicated(subset=['KEY_ID'], keep=False)
             df_m.loc[dup_mask, 'DATA_STATUS'] = 'ERROR'
             df_m.loc[dup_mask, 'ERROR_TAG'] += '[Duplicate RSBSA ID] '
             df_m.loc[dup_mask, 'CONFLICT_GROUP'] = 'STRICT-' + df_m.loc[dup_mask, 'KEY_ID']
 
-            # B. FUZZY IDENTITY CONFLICTS
-            # Only check rows that aren't already strict duplicates
+            # B. FUZZY MATCHING
+            # Using mapped columns if they exist
+            m_fname = 'first_name' if 'first_name' in df_m.columns else df_m.columns[1]
+            m_lname = 'last_name' if 'last_name' in df_m.columns else df_m.columns[3]
+            m_bday = 'birthday' if 'birthday' in df_m.columns else 'birthdate'
+            
+            # Create Signature
             df_m['LOOSE_SIG'] = (
                 df_m[m_lname].fillna('').astype(str).str.strip().str.upper() + 
                 df_m[m_bday].astype(str)
             )
             
-            # Filter candidates (Same Last Name + Bday)
             candidates = df_m[df_m['DATA_STATUS'] == 'CLEAN'].copy()
             potential_dupes = candidates[candidates.duplicated(subset=['LOOSE_SIG'], keep=False)]
             
             fuzzy_counter = 1
-            conflict_updates = [] # Store (index, error_tag, group_id)
-
             if not potential_dupes.empty:
                 for sig, group in potential_dupes.groupby('LOOSE_SIG'):
                     if len(group) < 2: continue
-                    rows = group.to_dict('records') # Convert to list of dicts for iteration
+                    rows = group.to_dict('records')
                     indices = group.index.tolist()
                     
-                    # Compare every pair in this group
                     for i in range(len(rows)):
                         for j in range(i + 1, len(rows)):
                             r1, r2 = rows[i], rows[j]
                             idx1, idx2 = indices[i], indices[j]
                             
-                            # 1. First Name Check (>85%)
                             name1 = str(r1.get(m_fname,'')).strip().upper()
                             name2 = str(r2.get(m_fname,'')).strip().upper()
                             
                             if similar(name1, name2) > 0.85:
-                                # 2. GENDER CHECK (The New Filter)
-                                if m_sex:
-                                    s1 = str(r1.get(m_sex, '')).strip().upper()
-                                    s2 = str(r2.get(m_sex, '')).strip().upper()
-                                    # If both have data and are different (M vs F), skip (not a dupe)
-                                    if s1 and s2 and s1 != s2:
-                                        continue 
+                                # Gender Check
+                                if 'gender' in df_m.columns:
+                                    s1 = str(r1.get('gender', '')).strip().upper()
+                                    s2 = str(r2.get('gender', '')).strip().upper()
+                                    if s1 and s2 and s1 != s2: continue 
 
-                                # If we get here, it's a Fuzzy Match
                                 group_id = f"FUZZY-{fuzzy_counter:04d}"
-                                conflict_updates.append((idx1, '[Identity Conflict]', group_id))
-                                conflict_updates.append((idx2, '[Identity Conflict]', group_id))
+                                df_m.at[idx1, 'DATA_STATUS'] = 'ERROR'
+                                df_m.at[idx2, 'DATA_STATUS'] = 'ERROR'
+                                df_m.at[idx1, 'ERROR_TAG'] += '[Identity Conflict] '
+                                df_m.at[idx2, 'ERROR_TAG'] += '[Identity Conflict] '
+                                df_m.at[idx1, 'CONFLICT_GROUP'] = group_id
+                                df_m.at[idx2, 'CONFLICT_GROUP'] = group_id
                                 fuzzy_counter += 1
 
-            # Apply Fuzzy Updates
-            for idx, tag, grp in conflict_updates:
-                df_m.at[idx, 'DATA_STATUS'] = 'ERROR'
-                # Append tag if not present
-                curr_tag = str(df_m.at[idx, 'ERROR_TAG'])
-                if tag not in curr_tag:
-                    df_m.at[idx, 'ERROR_TAG'] = curr_tag + tag + " "
-                # Assign Group (Overwrite is fine, means they belong to the latest cluster)
-                df_m.at[idx, 'CONFLICT_GROUP'] = grp
-
-        # --- 4. MERGING (ONE-TO-MANY) ---
-        with LoadingSpinner("Merging Masterlist with Parcels..."):
+        # --- 4. MERGE & INTEGRITY CHECK ---
+        with LoadingSpinner("Merging & Validating Integrity..."):
             
             df_m_clean = df_m[df_m['DATA_STATUS'] == 'CLEAN'].copy()
             df_m_error = df_m[df_m['DATA_STATUS'] == 'ERROR'].copy()
             
-            # Merge Clean
-            df_merged = pd.merge(df_m_clean, df_p, on='KEY_ID', how='left')
+            # MERGE
+            df_merged = pd.merge(df_m_clean, df_p, on='KEY_ID', how='left', suffixes=('', '_PARCEL'))
+            
             df_merged['HAS_PARCEL'] = df_merged['HAS_MULTIPLE_LAND_HOLDINGS'].notna()
-            df_merged['HAS_MULTIPLE_LAND_HOLDINGS'] = df_merged['HAS_MULTIPLE_LAND_HOLDINGS'].fillna('NO')
+            
+            # --- STRICT INTEGRITY LOOP ---
+            integrity_errors = []
+            
+            mask_has_parcel = df_merged['HAS_PARCEL'] == True
+            
+            for idx, row in df_merged[mask_has_parcel].iterrows():
+                mismatches = []
+                
+                # Check each pair in your map
+                for m_col, p_col_name in INTEGRITY_MAP.items():
+                    
+                    if m_col not in df_merged.columns: continue 
+                    val_m = str(row[m_col]).strip().upper()
+                    
+                    # Find Parcel Column
+                    actual_p_col = p_cols_map.get(p_col_name.strip().lower())
+                    if not actual_p_col: continue 
+                    
+                    target_p_col = actual_p_col
+                    if actual_p_col in df_m.columns: 
+                        target_p_col = f"{actual_p_col}_PARCEL"
+                    
+                    if target_p_col not in df_merged.columns: continue
+                    val_p = str(row[target_p_col]).strip().upper()
+                    
+                    # COMPARE
+                    is_empty_m = val_m in ['NAN', 'NONE', '', 'NAT', 'NULL']
+                    is_empty_p = val_p in ['NAN', 'NONE', '', 'NAT', 'NULL']
+                    
+                    if not is_empty_m and not is_empty_p:
+                        if val_m != val_p:
+                            mismatches.append(f"{m_col.upper()} ({val_m} != {val_p})")
+                
+                if mismatches:
+                    integrity_errors.append({
+                        'index': idx,
+                        'tag': f"[Data Mismatch] {'; '.join(mismatches)}"
+                    })
 
-        # --- 5. SPLIT, SORT & SAVE ---
-        with LoadingSpinner("Splitting and Sorting..."):
+            # Apply Integrity Errors
+            if integrity_errors:
+                for err in integrity_errors:
+                    idx = err['index']
+                    tag = err['tag']
+                    df_merged.at[idx, 'DATA_STATUS'] = 'ERROR'
+                    df_merged.at[idx, 'ERROR_TAG'] = tag
+                    df_merged.at[idx, 'CONFLICT_GROUP'] = f"DATA-ERR-{df_merged.at[idx, 'KEY_ID']}"
+
+        # --- 5. CLEANUP & SAVE ---
+        with LoadingSpinner("Finalizing Report..."):
             
-            df_with = df_merged[df_merged['HAS_PARCEL'] == True].copy()
-            df_no = df_merged[df_merged['HAS_PARCEL'] == False].copy()
+            df_valid = df_merged[df_merged['DATA_STATUS'] == 'CLEAN'].copy()
+            df_conflict_post = df_merged[df_merged['DATA_STATUS'] == 'ERROR'].copy()
             
-            # Cleanup
-            drop_cols = ['LOOSE_SIG', 'DATA_STATUS', 'ERROR_TAG', 'HAS_PARCEL', 'parcel_count_temp', 'CONFLICT_GROUP']
-            final_cols_with = [c for c in df_with.columns if c not in drop_cols]
+            df_with = df_valid[df_valid['HAS_PARCEL'] == True].copy()
+            df_no = df_valid[df_valid['HAS_PARCEL'] == False].copy()
             
-            # Standard Sorting for Clean Data
+            all_errors = pd.concat([df_m_error, df_conflict_post], ignore_index=True)
+            
+            # --- COLUMN UNIFORMITY LOGIC ---
+            # Drop the mapped Parcel columns (to remove redundancy)
+            cols_to_drop = []
+            for p_name in INTEGRITY_MAP.values():
+                lower_p = p_name.strip().lower()
+                if lower_p in p_cols_map:
+                    real_name = p_cols_map[lower_p]
+                    cols_to_drop.append(real_name)
+                    cols_to_drop.append(f"{real_name}_PARCEL")
+            
+            helpers = ['LOOSE_SIG', 'DATA_STATUS', 'ERROR_TAG', 'HAS_PARCEL', 'parcel_count_temp', 'CONFLICT_GROUP', 'KEY_ID']
+            cols_to_drop.extend(helpers)
+            
+            # Keep clean columns
+            final_cols = [c for c in df_with.columns if c not in cols_to_drop]
+            
+            # SORTING
             sort_keys = []
-            m_mun = next((c for c in df_with.columns if 'mun' in c.lower() and 'address' in c.lower()), None)
-            m_bgy = next((c for c in df_with.columns if 'bgy' in c.lower() and 'address' in c.lower()), None)
-            m_last = next((c for c in df_with.columns if 'last' in c.lower() and 'name' in c.lower()), None)
-            
-            if m_mun: sort_keys.append(m_mun)
-            if m_bgy: sort_keys.append(m_bgy)
-            if m_last: sort_keys.append(m_last)
+            if 'farmer_address_mun' in final_cols: sort_keys.append('farmer_address_mun')
+            if 'farmer_address_bgy' in final_cols: sort_keys.append('farmer_address_bgy')
+            if 'last_name' in final_cols: sort_keys.append('last_name')
             
             if sort_keys:
                 df_with.sort_values(by=sort_keys, inplace=True)
                 df_no.sort_values(by=sort_keys, inplace=True)
-
-            # --- SORTING FOR ERRORS (NEIGHBOR CLUSTERING) ---
-            # We sort primarily by 'CONFLICT_GROUP' so matching rows stay together
-            if not df_m_error.empty:
-                df_m_error.sort_values(by=['CONFLICT_GROUP', m_last], inplace=True)
+                
+            if not all_errors.empty:
+                err_keys = ['CONFLICT_GROUP'] + [k for k in sort_keys if k in all_errors.columns]
+                all_errors.sort_values(by=err_keys, inplace=True)
 
             # SAVE
             with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
-                df_with.to_excel(writer, sheet_name='Clean - With Parcels', index=False)
-                df_no[[c for c in df_m.columns if c not in drop_cols]].to_excel(writer, sheet_name='Clean - No Parcels', index=False)
+                df_with[final_cols].to_excel(writer, sheet_name='Clean - With Parcels', index=False)
                 
-                # Save Errors with the Conflict Group visible so user knows why they are neighbors
-                err_cols = ['CONFLICT_GROUP', 'ERROR_TAG'] + [c for c in df_m.columns if c not in ['CONFLICT_GROUP', 'ERROR_TAG', 'LOOSE_SIG', 'DATA_STATUS']]
-                df_m_error[err_cols].to_excel(writer, sheet_name='Erroneous & Conflicts', index=False)
+                cols_no_parcels = [c for c in final_cols if c in df_m.columns]
+                df_no[cols_no_parcels].to_excel(writer, sheet_name='Clean - No Parcels', index=False)
                 
-                # Format Errors
+                err_display_cols = ['CONFLICT_GROUP', 'ERROR_TAG'] + [c for c in all_errors.columns if c not in helpers]
+                all_errors[err_display_cols].to_excel(writer, sheet_name='Erroneous & Conflicts', index=False)
+                
                 wb = writer.book
                 ws_err = writer.sheets['Erroneous & Conflicts']
                 red_fmt = wb.add_format({'font_color': '#9C0006', 'bg_color': '#FFC7CE'})
-                
-                # Highlight the Group ID and Tag
-                ws_err.conditional_format(1, 0, len(df_m_error), 1, {'type': 'no_blanks', 'format': red_fmt})
-                ws_err.set_column(0, 1, 25) # Widen columns
+                ws_err.conditional_format(1, 0, len(all_errors), 0, {'type': 'no_blanks', 'format': red_fmt})
+                ws_err.set_column(0, 1, 30)
 
         print(f"🎉 Processed: {output_filename}")
-        print(f"   (Errors Sorted by Conflict Neighbor)")
+        if integrity_errors:
+            print(f"   ⚠️ Found {len(integrity_errors)} Data Mismatches (Addresses Ignored).")
 
     except Exception as e:
         print(f"❌ Error: {e}")
