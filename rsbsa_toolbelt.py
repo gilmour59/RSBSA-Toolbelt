@@ -528,137 +528,146 @@ def run_regional_consolidation(input_dir, output_dir):
 
 # --- MODE 4: REGIONAL SUMMARY (Renamed from 3) ---
 
-def process_rsbsa_report(file_path, output_dir):
-    # User Inputs
-    as_of_input = input("\n📅 Enter 'As Of' Date (e.g., Oct 30, 2024): ").strip()
-    if not as_of_input:
-        ref_date = datetime.now()
-        as_of_str = ref_date.strftime("%B %d, %Y")
-    else:
-        try:
-            ref_date = pd.to_datetime(as_of_input)
-            as_of_str = as_of_input
-        except:
-            print("⚠️  Could not parse date. Using today for age calculations.")
-            ref_date = datetime.now()
-            as_of_str = as_of_input
+def run_regional_analytics_mode4(input_dir, output_dir):
+    """
+    MODE 4: REGIONAL DASHBOARD GENERATOR
+    Analyzes the 3 outputs from Mode 3:
+      1. Regional_With_Parcels.xlsx
+      2. Regional_No_Parcels.xlsx
+      3. Regional_Erroneous.xlsx
+    
+    Generates: 'Regional_Analytics_Dashboard.xlsx'
+    """
+    
+    print("\n--- Starting Regional Analytics (Mode 4) ---")
+    
+    # Expected Inputs (Must match Mode 3 outputs)
+    files = {
+        'PARCEL': 'Regional_With_Parcels.xlsx',
+        'NO_PARCEL': 'Regional_No_Parcels.xlsx',
+        'ERROR': 'Regional_Erroneous.xlsx'
+    }
+    
+    # Check if files exist in the target directory
+    for key, fname in files.items():
+        f_path = os.path.join(input_dir, fname)
+        if not os.path.exists(f_path):
+            print(f"❌ Critical Error: Missing '{fname}'")
+            print(f"   Ensure you have run Mode 3 and selected the correct folder (Input/Output).")
+            return
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    default_name = f"RSBSA_Region6_Summary_{timestamp}.xlsx"
-    output_filename = get_output_filename(default_name)
-    output_path = os.path.join(output_dir, output_filename)
+    # Initialize Stats Storage
+    stats = {p: {
+        'Farmers_With_Land': 0, 'Farmers_No_Land': 0, 'Erroneous_Entries': 0,
+        'Rice_Area_Ha': 0.0, 'Corn_Area_Ha': 0.0, 'Sugar_Area_Ha': 0.0, 'Total_Land_Ha': 0.0,
+        'Male': 0, 'Female': 0, 'Youth_12_30': 0, 'Senior_60_Up': 0
+    } for p in REQUIRED_PROVINCES}
 
     try:
-        def col_filter(col_name):
-            return col_name.strip().lower() in TARGET_COLS_RSBSA
+        # --- PHASE 1: ANALYZE FARMERS WITH PARCELS ---
+        path_p = os.path.join(input_dir, files['PARCEL'])
+        with LoadingSpinner("Analyzing Land Data..."):
+            xls = pd.ExcelFile(path_p)
+            for prov in REQUIRED_PROVINCES:
+                if prov in xls.sheet_names:
+                    df = pd.read_excel(xls, sheet_name=prov)
+                    
+                    stats[prov]['Farmers_With_Land'] = len(df)
+                    stats[prov]['Rice_Area_Ha'] = df['AREA_RICE_HA'].sum()
+                    stats[prov]['Corn_Area_Ha'] = df['AREA_CORN_HA'].sum()
+                    stats[prov]['Sugar_Area_Ha'] = df['AREA_SUGAR_HA'].sum()
+                    stats[prov]['Total_Land_Ha'] = df['TOTAL_PARCEL_AREA_HA'].sum()
+                    
+                    # Demographics (Sex)
+                    col_sex = next((c for c in df.columns if 'sex' in c.lower() or 'gender' in c.lower()), None)
+                    if col_sex:
+                        s_counts = df[col_sex].astype(str).str.upper().value_counts()
+                        stats[prov]['Male'] += s_counts.get('MALE', 0) + s_counts.get('M', 0)
+                        stats[prov]['Female'] += s_counts.get('FEMALE', 0) + s_counts.get('F', 0)
+                    
+                    # Demographics (Age)
+                    col_bday = next((c for c in df.columns if 'birth' in c.lower()), None)
+                    if col_bday:
+                        df[col_bday] = pd.to_datetime(df[col_bday], errors='coerce')
+                        now = datetime.now()
+                        df['AGE'] = (now - df[col_bday]).dt.days // 365
+                        stats[prov]['Youth_12_30'] += len(df[(df['AGE'] >= 12) & (df['AGE'] <= 30)])
+                        stats[prov]['Senior_60_Up'] += len(df[df['AGE'] >= 60])
 
-        with LoadingSpinner(f"Loading '{os.path.basename(file_path)}'..."):
-            xls = pd.read_excel(file_path, sheet_name=None, usecols=col_filter)
+        # --- PHASE 2: ANALYZE FARMERS NO PARCELS ---
+        path_np = os.path.join(input_dir, files['NO_PARCEL'])
+        with LoadingSpinner("Analyzing Farmers w/o Land..."):
+            xls = pd.ExcelFile(path_np)
+            for prov in REQUIRED_PROVINCES:
+                if prov in xls.sheet_names:
+                    df = pd.read_excel(xls, sheet_name=prov)
+                    stats[prov]['Farmers_No_Land'] = len(df)
+                    
+                    # Add to demographics
+                    col_sex = next((c for c in df.columns if 'sex' in c.lower() or 'gender' in c.lower()), None)
+                    if col_sex:
+                        s_counts = df[col_sex].astype(str).str.upper().value_counts()
+                        stats[prov]['Male'] += s_counts.get('MALE', 0) + s_counts.get('M', 0)
+                        stats[prov]['Female'] += s_counts.get('FEMALE', 0) + s_counts.get('F', 0)
+                        
+                    col_bday = next((c for c in df.columns if 'birth' in c.lower()), None)
+                    if col_bday:
+                        df[col_bday] = pd.to_datetime(df[col_bday], errors='coerce')
+                        now = datetime.now()
+                        df['AGE'] = (now - df[col_bday]).dt.days // 365
+                        stats[prov]['Youth_12_30'] += len(df[(df['AGE'] >= 12) & (df['AGE'] <= 30)])
+                        stats[prov]['Senior_60_Up'] += len(df[df['AGE'] >= 60])
+
+        # --- PHASE 3: ANALYZE ERRORS ---
+        path_err = os.path.join(input_dir, files['ERROR'])
+        with LoadingSpinner("Analyzing Error Logs..."):
+            xls = pd.ExcelFile(path_err)
+            for prov in REQUIRED_PROVINCES:
+                if prov in xls.sheet_names:
+                    df = pd.read_excel(xls, sheet_name=prov)
+                    stats[prov]['Erroneous_Entries'] = len(df)
+
+        # --- PHASE 4: COMPILE & SAVE REPORT ---
+        output_filename = f"Regional_Analytics_Dashboard_{datetime.now().strftime('%Y%m%d')}.xlsx"
+        output_path = os.path.join(output_dir, output_filename)
         
-        sheet_names = set(xls.keys())
-        
-        # VALIDATE
-        missing_provinces = REQUIRED_PROVINCES - sheet_names
-        if missing_provinces:
-            print("\n🛑 VALIDATION FAILED: Missing Province Sheets")
-            print(f"   Missing: {', '.join(missing_provinces)}")
-            return
-        
-        print("✅ Validation Passed.")
+        with LoadingSpinner("Generating Dashboard..."):
+            # Convert Dict to DataFrame
+            df_stats = pd.DataFrame.from_dict(stats, orient='index')
+            df_stats.index.name = 'PROVINCE'
+            df_stats.reset_index(inplace=True)
+            
+            # Add Totals Row
+            sum_row = df_stats.sum(numeric_only=True)
+            sum_row['PROVINCE'] = 'REGION 6 TOTAL'
+            df_stats = pd.concat([df_stats, pd.DataFrame([sum_row])], ignore_index=True)
 
-        with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
-            for province in REQUIRED_PROVINCES:
-                with LoadingSpinner(f"Processing {province}..."):
-                    df = xls[province]
-                    df.columns = [c.strip().lower() for c in df.columns]
+            with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+                df_stats.to_excel(writer, sheet_name='Executive Summary', index=False)
+                
+                wb = writer.book
+                ws = writer.sheets['Executive Summary']
+                
+                # Formats
+                fmt_header = wb.add_format({'bold': True, 'align': 'center', 'bg_color': '#D9E1F2', 'border': 1})
+                fmt_num = wb.add_format({'num_format': '#,##0', 'border': 1})
+                fmt_dec = wb.add_format({'num_format': '#,##0.00', 'border': 1})
+                fmt_total = wb.add_format({'bold': True, 'bg_color': '#FFFFCC', 'border': 1, 'num_format': '#,##0'})
+                
+                # Apply Formats
+                ws.set_column(0, 0, 20) # Province col
+                ws.set_column(1, 3, 15, fmt_num) # Counts
+                ws.set_column(4, 7, 18, fmt_dec) # Areas
+                ws.set_column(8, 11, 12, fmt_num) # Demographics
+                
+                # Highlight Total Row
+                last_row = len(df_stats)
+                ws.set_row(last_row, None, fmt_total)
 
-                    if df.empty: continue
-
-                    col_mun = 'farmer_address_mun'
-                    col_bgy = 'farmer_address_bgy'
-                    col_farmer = 'farmer'
-                    col_farmworker = 'farmworker'
-                    col_fisher = 'fisherfolk'
-                    col_gender = 'gender'
-                    col_agency = 'agency'
-                    col_birthday = 'birthday'
-                    col_area = 'crop_area'
-
-                    # Counts
-                    df['is_farmer'] = df[col_farmer].astype(str).str.upper().map({'YES': 1}).fillna(0)
-                    df['is_farmworker'] = df[col_farmworker].astype(str).str.upper().map({'YES': 1}).fillna(0)
-                    df['is_fisher'] = df[col_fisher].astype(str).str.upper().map({'YES': 1}).fillna(0)
-                    df['male_count'] = df[col_gender].astype(str).str.upper().map({'MALE': 1}).fillna(0)
-                    df['female_count'] = df[col_gender].astype(str).str.upper().map({'FEMALE': 1}).fillna(0)
-
-                    # Age
-                    df['bd_dt'] = pd.to_datetime(df[col_birthday], errors='coerce')
-                    df['age_years'] = (ref_date - df['bd_dt']).dt.days / 365.25
-                    df['age_years'] = df['age_years'].fillna(-1)
-                    
-                    # Youth 12-30
-                    df['is_youth'] = ((df['age_years'] >= 12) & (df['age_years'] <= 30)).astype(int)
-                    df['is_working_age'] = ((df['age_years'] > 30) & (df['age_years'] < 60)).astype(int)
-                    df['is_senior'] = (df['age_years'] >= 60).astype(int)
-
-                    # Crop Area Analytics
-                    if col_area in df.columns:
-                        df[col_area] = pd.to_numeric(df[col_area], errors='coerce').fillna(0)
-                    else:
-                        df[col_area] = 0.0
-                    
-                    # Rows with area >= 2
-                    df['is_large_area'] = (df[col_area] >= 2).astype(int)
-
-                    summary = df.groupby([col_mun, col_bgy]).agg({
-                        'is_farmer': 'sum',
-                        'is_farmworker': 'sum',
-                        'is_fisher': 'sum',
-                        col_agency: 'nunique',
-                        'male_count': 'sum',
-                        'female_count': 'sum',
-                        'is_youth': 'sum',
-                        'is_working_age': 'sum',
-                        'is_senior': 'sum',
-                        col_area: 'sum',       # Sum of Declared Area
-                        'is_large_area': 'sum' # Count of >= 2
-                    }).reset_index()
-
-                    summary.columns = [
-                        'Municipality', 'Barangay', 
-                        'Farmers', 'Farmworkers', 'Fisherfolk', 
-                        'Distinct Agencies', 'Male', 'Female',
-                        'Youth (12-30)', 'Working Age (31-59)', 'Senior (60+)',
-                        'Total Declared Area (Ha)', 'Farmers with >= 2 Ha'
-                    ]
-
-                    summary = summary.sort_values(['Municipality', 'Barangay'])
-
-                    summary.to_excel(writer, sheet_name=province, index=False, startrow=4)
-                    
-                    # Headers
-                    workbook = writer.book
-                    worksheet = writer.sheets[province]
-                    header_format = workbook.add_format({'bold': True, 'font_size': 14})
-                    date_format = workbook.add_format({'italic': True})
-                    legend_format = workbook.add_format({'italic': True, 'font_color': 'gray', 'font_size': 10})
-                    num_fmt = workbook.add_format({'num_format': '#,##0.00'})
-                    
-                    worksheet.write('A1', f"RSBSA Summary Report - {province}", header_format)
-                    worksheet.write('A2', f"As of: {as_of_str}", date_format)
-                    worksheet.write('A3', "Age Legend: Youth (12-30) | Working Age (31-59) | Senior (60+)", legend_format)
-                    
-                    worksheet.set_column(0, 0, 20)
-                    worksheet.set_column(1, 1, 25)
-                    worksheet.set_column(2, 10, 15)
-                    worksheet.set_column(11, 11, 22, num_fmt) # Format Area Column
-                    worksheet.set_column(12, 12, 20)          # Format >=2 Column
-
-        print(f"\n🎉 Report Generated: {output_filename}")
-        print(f"   Location: {output_path}")
+        print(f"\n📊 Analytics Generated: {output_filename}")
 
     except Exception as e:
-        print(f"❌ Critical Error: {e}")
+        print(f"❌ Error Generating Analytics: {e}")
 
 # --- MODE 5: GEOTAG PROCESSOR (Renamed from 4) ---
 
@@ -963,8 +972,15 @@ def run_cli_app():
                 if p: process_masterlist_merger(m, p, output_dir)
         elif choice == "3": run_regional_consolidation(input_dir, output_dir)
         elif choice == "4":
-            t = select_input_file(input_dir); 
-            if t: process_rsbsa_report(t, output_dir)
+            print("\nWhere are the Regional Files located?")
+            print(f" [1] Input Folder (./{INPUT_FOLDER_NAME})")
+            print(f" [2] Output Folder (./{OUTPUT_FOLDER_NAME})")
+            loc = input("Select Source: ").strip()
+            
+            # Default to output_dir if they choose 2, else input_dir
+            target_source_dir = output_dir if loc == '2' else input_dir
+            
+            run_regional_analytics_mode4(target_source_dir, output_dir)
         elif choice == "5": run_mode_5_workflow(input_dir, output_dir) # Renamed logic function
         elif choice == "6": process_cross_file_audit(input_dir, output_dir)
         elif choice == "7": process_gpx_fixer(input_dir, output_dir)
