@@ -642,7 +642,7 @@ def run_regional_consolidation(input_dir, output_dir):
 
 # --- MODE 4: REGIONAL SUMMARY (Renamed from 3) ---
 
-def run_regional_analytics_mode4(input_dir, output_dir):
+def run_regional_analytics_mode(input_dir, output_dir):
     """
     MODE 4: FARMERS REGISTRY GENERATOR (FINAL)
     
